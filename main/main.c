@@ -9,14 +9,26 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "mqtt_client.h"
+
+#include "sd_logger.h"
+#include "ds18b20.h"
+#include "wifi_manager.h"
 
 // ============== DEFINICJE ==============
 #define NVS_NAMESPACE "furnace"
 #define NVS_CONFIG_KEY "config"
 
 #define BUFFER_SIZE 5           // Rozmiar bufora historii temperatur
-#define TEMP_OVERHEAT 95        // Stała temperatura przegrzania
+#define TEMP_OVERHEAT 95        // Próg temperatury przegrzania
 #define TEMP_FREEZE_THRESHOLD 4 // Próg temperatury do alertu ochłodzenia
+#define NUM_TEMP_SENSORS 4      // Liczba czujników DS18B20
+
+#define MQTT_BROKER_URI "mqtt://192.168.0.113:1883"  // Adres brokera MQTT --- mqtt://192.168.1.100:1883
+#define MQTT_BASE_TOPIC "furnace"     // Podstawowy temat MQTT
+#define LWT_TOPIC       MQTT_BASE_TOPIC "/availability" // Temat LWT
+#define LWT_PAYLOAD_OFFLINE "offline"                   // Ładunek LWT offline
+#define LWT_PAYLOAD_ONLINE  "online"                    // Ładunek LWT online
 
 static const char *TAG = "FURNACE";
 
@@ -64,6 +76,11 @@ typedef struct {
     gpio_num_t pin_pump_floor;              // Pompa podłogówki - ON/OFF
     gpio_num_t pin_pump_mixing_control;     // Sterowanie triakiem pompy mieszającej
     gpio_num_t pin_blower_control;          // Sterowanie triakiem dmuchawy
+
+    gpio_num_t pin_temp_sensor_furnace;         // Czujnik temperatury pieca
+    gpio_num_t pin_temp_sensor_boiler_top;      // Czujnik temperatury góry bojlera
+    gpio_num_t pin_temp_sensor_boiler_bottom;   // Czujnik temperatury dołu bojlera
+    gpio_num_t pin_temp_sensor_main_output;     // Czujnik temperatury wody wyjściowej
     
 } furnace_config_t;
 
@@ -71,7 +88,7 @@ typedef struct {
 static const furnace_config_t default_config = {
     .temp_target_work = 60,
     .temp_ignition = 25,
-    .temp_shutdown = 40,
+    .temp_shutdown = 45,
     .temp_safe_after_overheat = 80,
     
     .temp_activ_pump_main = 45,
@@ -102,6 +119,11 @@ static const furnace_config_t default_config = {
     .pin_pump_floor = GPIO_NUM_26,
     .pin_pump_mixing_control = GPIO_NUM_27,
     .pin_blower_control = GPIO_NUM_32,
+
+    .pin_temp_sensor_furnace = GPIO_NUM_4,
+    .pin_temp_sensor_boiler_top = GPIO_NUM_5,
+    .pin_temp_sensor_boiler_bottom = GPIO_NUM_18,
+    .pin_temp_sensor_main_output = GPIO_NUM_19,
 };
 
 // ============== TYPY ==============
@@ -159,6 +181,9 @@ typedef struct {
 static furnace_config_t config;
 static furnace_runtime_t runtime = {0};
 static SemaphoreHandle_t furnace_mutex;
+static ds18b20_sensor_t temp_sensors[NUM_TEMP_SENSORS];
+static esp_mqtt_client_handle_t mqtt_client = NULL;
+static bool mqtt_connected = false;
 
 
 // ============== PROTOTYPY ==============
@@ -268,6 +293,110 @@ uint8_t interpolate_linear(int16_t value, int16_t min_val, int16_t max_val, uint
     
     return (uint8_t)power;
 }
+
+static bool mqtt_data_equals(esp_mqtt_event_handle_t event, const char* expected) {
+    size_t expected_len = strlen(expected);
+    return (event->data_len == expected_len && strncmp(event->data, expected, expected_len) == 0);
+}
+
+
+// MQTT event handler
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, 
+                               int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_client_handle_t client = event->client;
+    
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT Connected to broker");
+            mqtt_connected = true;
+            esp_mqtt_client_publish(client, LWT_TOPIC, LWT_PAYLOAD_ONLINE, 0, 1, true);
+            
+            // Subscribe to command topics
+            esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/ignition", 0);
+            esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/shutdown", 0);
+            esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/config", 0);
+            ESP_LOGI(TAG, "Subscribed to command topics");
+            break;
+            
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "MQTT Disconnected");
+            mqtt_connected = false;
+            break;
+            
+        case MQTT_EVENT_DATA:
+            ESP_LOGI(TAG, "MQTT Data received on topic: %.*s", 
+                     event->topic_len, event->topic);
+            
+            // Handle commands
+            if (strncmp(event->topic, MQTT_BASE_TOPIC "/command/ignition", event->topic_len) == 0) {
+                if (mqtt_data_equals(event, "START")) {
+                    xSemaphoreTake(furnace_mutex, portMAX_DELAY);
+                    runtime.manual_ignition_requested = true;
+                    xSemaphoreGive(furnace_mutex);
+                    ESP_LOGI(TAG, "Manual ignition requested via MQTT");
+                }
+            }
+            else if (strncmp(event->topic, MQTT_BASE_TOPIC "/command/shutdown", event->topic_len) == 0) {
+                if (mqtt_data_equals(event, "STOP")) {
+                    xSemaphoreTake(furnace_mutex, portMAX_DELAY);
+                    runtime.manual_shutdown_requested = true;
+                    xSemaphoreGive(furnace_mutex);
+                    ESP_LOGI(TAG, "Manual shutdown requested via MQTT");
+                }
+            }
+            break;
+            
+        case MQTT_EVENT_ERROR:
+            ESP_LOGE(TAG, "MQTT Error occurred");
+            mqtt_connected = false;
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// Inicjalizacja klienta MQTT
+static void mqtt_init(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+        .session.last_will.topic = LWT_TOPIC,
+        .session.last_will.msg = LWT_PAYLOAD_OFFLINE,
+        .session.last_will.msg_len = strlen(LWT_PAYLOAD_OFFLINE),
+        .session.last_will.qos = 1,
+        .session.last_will.retain = true,
+
+        // Authentication:
+        // .credentials.username = "username",
+        // .credentials.password = "password",
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (mqtt_client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+        return;
+    }
+    
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, 
+                                   mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+    ESP_LOGI("MQTT", "client started");
+}
+
+// Funkcja publikująca dane do MQTT
+static int mqtt_publish_data(const char *topic, const char *data)
+{
+    if (!mqtt_connected || mqtt_client == NULL) {
+        return -1;
+    }
+    
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, data, 0, 1, 0);
+    return msg_id;
+}
+
 
 // ============== LOGIKA POMP ==============
 
@@ -575,6 +704,7 @@ void fsm_update(void) {
 
     // Dodatkowy warunek przegrzania gdy temperatura wyjściowa wody jest wysoka
     if (runtime.temp_main_output > TEMP_OVERHEAT - 5) {
+        ESP_LOGW(TAG, "High output water temperature detected: %d°C", runtime.temp_main_output);
         next_state = STATE_OVERHEAT;
     }
     
@@ -598,23 +728,25 @@ state_change:
 // TASK 1: Odczyt czujników (wysoki priorytet)
 void sensor_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
+    float temperatures[NUM_TEMP_SENSORS];
     
     while (1) {
-        // Odczyt wszystkich czujników DS18B20 (RAW)
-        int16_t temp_furnace_raw = read_temp_sensor(0);
-        int16_t temp_boiler_top_raw = read_temp_sensor(1);
-        int16_t temp_boiler_bottom_raw = read_temp_sensor(2);
-        int16_t temp_main_raw = read_temp_sensor(3);
+        int success = ds18b20_read_all(temp_sensors, NUM_TEMP_SENSORS, temperatures);
         
-        // Bezpieczna aktualizacja
+        if (success < NUM_TEMP_SENSORS) {
+            ESP_LOGW(TAG, "Only %d/%d sensors read successfully", success, NUM_TEMP_SENSORS);
+        }
+
         xSemaphoreTake(furnace_mutex, portMAX_DELAY);
         
-        // Zapisz RAW
-        runtime.temp_furnace_raw = temp_furnace_raw;
-        runtime.temp_boiler_top_raw = temp_boiler_top_raw;
-        runtime.temp_boiler_bottom_raw = temp_boiler_bottom_raw;
-        runtime.temp_main_output_raw = temp_main_raw;
-        
+        // Odczyt wszystkich czujników DS18B20 (RAW)
+        runtime.temp_furnace_raw = (int16_t)temperatures[0];
+        runtime.temp_boiler_top_raw = (int16_t)temperatures[1];
+        runtime.temp_boiler_bottom_raw = (int16_t)temperatures[2];
+        runtime.temp_main_output_raw = (int16_t)temperatures[3];
+
+        //TODO: co w przypadku błędu odczytu?
+                
         // Zastosuj korekty
         apply_temp_corrections();
             
@@ -659,35 +791,92 @@ void control_task(void *pvParameters) {
 // TASK 4: Komunikacja MQTT (niski priorytet)
 void mqtt_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
+    char topic[96];
+    char payload[512];
+    
+    ESP_LOGI(TAG, "MQTT Task started, waiting for WiFi...");
+    
+    // Czekaj na połączenie WiFi
+    while (!wifi_is_connected()) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    
+    // Inicjalizacja MQTT
+    mqtt_init();
     
     while (1) {
-        // Skopiuj dane bezpiecznie
-        // xSemaphoreTake(furnace_mutex, portMAX_DELAY);
-        // furnace_state_t state = runtime.current_state;
-        // int16_t temp_furnace = runtime.temp_furnace;
-        // int16_t temp_boiler_top = runtime.temp_boiler_top;
-        // int16_t temp_boiler_bottom = runtime.temp_boiler_bottom;
-        // int16_t temp_main = runtime.temp_main_output;
-        // bool pump_main = runtime.pump_main_on;
-        // bool pump_floor = runtime.pump_floor_on;
-        // uint8_t pump_mixing = runtime.pump_mixing_power;
-        // uint8_t blower = runtime.blower_power;
-        // xSemaphoreGive(furnace_mutex);
+        // Sprawdź połączenie WiFi
+        if (!wifi_is_connected()) {
+            ESP_LOGW(TAG, "WiFi not connected, waiting...");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
         
-        // TODO: Wyślij przez MQTT
-        // mqtt_publish("furnace/state", state_to_string(state));
-        // mqtt_publish("furnace/temp_furnace", temp_furnace);
-        // mqtt_publish("furnace/temp_boiler_top", temp_boiler_top);
-        // mqtt_publish("furnace/temp_boiler_bottom", temp_boiler_bottom);
-        // mqtt_publish("furnace/temp_main", temp_main);
-        // mqtt_publish("furnace/pump_main", pump_main ? "ON" : "OFF");
-        // mqtt_publish("furnace/pump_floor", pump_floor ? "ON" : "OFF");
-        // mqtt_publish("furnace/pump_mixing_power", pump_mixing);
-        // mqtt_publish("furnace/blower_power", blower);
+        // Sprawdź połączenie MQTT
+        if (!mqtt_connected) {
+            ESP_LOGW(TAG, "MQTT not connected, waiting...");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
         
-        // ESP_LOGI(TAG, "State=%s | T_furnace=%d°C, T_boiler_top=%d°C, T_boiler_bot=%d°C | Blower=%d%%, Pump_mix=%d%%",
-        //        state_to_string(state), temp_furnace, temp_boiler_top, temp_boiler_bottom, blower, pump_mixing);
+        // Pobierz dane do publikacji
+        xSemaphoreTake(furnace_mutex, portMAX_DELAY);
         
+        furnace_state_t state = runtime.current_state;
+        int16_t temp_furnace = runtime.temp_furnace;
+        int16_t temp_boiler_top = runtime.temp_boiler_top;
+        int16_t temp_boiler_bottom = runtime.temp_boiler_bottom;
+        int16_t temp_main = runtime.temp_main_output;
+        bool pump_main = runtime.pump_main_on;
+        bool pump_floor = runtime.pump_floor_on;
+        uint8_t pump_mixing = runtime.pump_mixing_power;
+        uint8_t blower = runtime.blower_power;
+        bool error = runtime.error_flag;
+        
+        xSemaphoreGive(furnace_mutex);
+        
+        // Publikuj dane w formacie JSON
+        snprintf(topic, sizeof(topic), "%s/status", MQTT_BASE_TOPIC);
+        snprintf(payload, sizeof(payload), 
+                 "{"
+                 "\"state\":\"%s\","
+                 "\"temperatures\":{"
+                   "\"furnace\":%d,"
+                   "\"boiler_top\":%d,"
+                   "\"boiler_bottom\":%d,"
+                   "\"main_output\":%d"
+                 "},"
+                 "\"pumps\":{"
+                   "\"main\":\"%s\","
+                   "\"floor\":\"%s\","
+                   "\"mixing_power\":%d"
+                 "},"
+                 "\"blower\":{\"power\":%d},"
+                 "\"system\":{"
+                   "\"error\":\"%s\","
+                   "\"rssi\":%d,"
+                   "\"heap\":%lu,"
+                 "}"
+                 "}",
+                 state_to_string(state),
+                 temp_furnace, temp_boiler_top, temp_boiler_bottom, temp_main,
+                 pump_main ? "ON" : "OFF", 
+                 pump_floor ? "ON" : "OFF",
+                 pump_mixing,
+                 blower,
+                 error ? "ERROR" : "OK",
+                 wifi_get_rssi(), 
+                 esp_get_free_heap_size());
+
+        int msg_id = mqtt_publish_data(topic, payload);
+        
+        if (msg_id >= 0) {
+            ESP_LOGI(TAG, "MQTT Published: State=%s, T_furnace=%d°C, msg_id=%d",
+                     state_to_string(state), temp_furnace, msg_id);
+        } else {
+            ESP_LOGE(TAG, "MQTT Publish failed!");
+        }
+
         // Co 5 sekund
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5000));
     }
@@ -723,6 +912,7 @@ void watchdog_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(10000)); // Co 10 sekund
     }
 }
+
 
 // ============== FUNKCJE POMOCNICZE ==============
 void set_pump_main(bool state) {
@@ -768,17 +958,16 @@ void set_blower_power(uint8_t power) {
 }
 
 int16_t read_temp_sensor(int sensor_id) {
-    // TODO: Implementacja odczytu DS18B20
-    // Zwróć wartość jako int16_t (np. 25°C -> 25, -5°C -> -5)
-    
-    // Symulacja dla testów
-    switch(sensor_id) {
-        case 0: return 25; // Piec
-        case 1: return 55; // Bojler góra
-        case 2: return 50; // Bojler dół
-        case 3: return 23; // Main output
-        default: return 25;
+    if (sensor_id < 0 || sensor_id >= NUM_TEMP_SENSORS) {
+        return 500; // Zwróć wartość błędu dla nieprawidłowego ID
     }
+
+    if (temp_sensors[sensor_id].is_valid) {
+        return (int16_t)temp_sensors[sensor_id].last_temperature;
+    }
+
+    // Zwróć wartość błędu jeśli czujnik nie jest dostępny
+    return 500;
 }
 
 uint32_t millis(void) {
@@ -815,6 +1004,9 @@ void app_main(void) {
         memcpy(&config, &default_config, sizeof(furnace_config_t));
         config_save_to_nvs();
     }
+
+    //TODO: Inicjalizacja karty SD i jeśli poprawna, to wczytanie konfiguracji z pliku, a jeśli nie to defaultowej
+    //TODO: Aktywowanie zapisywania logów również do pliku na karcie SD
     
     // Wyświetl aktualną konfigurację
     ESP_LOGI(TAG, "=== Configuration ===");
@@ -836,6 +1028,13 @@ void app_main(void) {
            config.temp_correction_furnace, 
            config.temp_correction_boiler_top,
            config.temp_correction_boiler_bottom);
+
+    // Inicjalizacja WiFi
+    ESP_LOGI(TAG, "Initializing WiFi...");
+    err = wifi_init_sta();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi initialization failed, will retry in background");
+    }
     
     // Inicjalizacja GPIO dla pomp ON/OFF
     gpio_config_t io_conf = {
@@ -861,8 +1060,17 @@ void app_main(void) {
     // triac_init(config.pin_pump_mixing_control);
     // triac_init(config.pin_blower_control);
     
-    // TODO: Inicjalizacja DS18B20
-    // ds18b20_init();
+    // Inicjalizacja czujników temperatury DS18B20
+    temp_sensors[0].gpio_pin = config.pin_temp_sensor_furnace;
+    temp_sensors[1].gpio_pin = config.pin_temp_sensor_boiler_top;
+    temp_sensors[2].gpio_pin = config.pin_temp_sensor_boiler_bottom;
+    temp_sensors[3].gpio_pin = config.pin_temp_sensor_main_output;
+
+    err = ds18b20_init(temp_sensors, NUM_TEMP_SENSORS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize DS18B20 sensors!\nRestarting...");
+        // esp_restart();
+    }
     
     // Mutex
     furnace_mutex = xSemaphoreCreateMutex();
