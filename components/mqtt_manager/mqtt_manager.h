@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 // MQTT Configuration
-#define MQTT_BROKER_URI "mqtt://192.168.0.113:1883"
+#define MQTT_BROKER_URI "mqtt://192.168.2.120:1883" // "mqtt://192.168.0.113:1883"
 #define MQTT_BASE_TOPIC "furnace"
 #define LWT_TOPIC       MQTT_BASE_TOPIC "/availability"
 #define LWT_PAYLOAD_OFFLINE "offline"

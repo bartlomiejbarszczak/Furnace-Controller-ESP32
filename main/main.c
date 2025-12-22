@@ -42,11 +42,17 @@ void update_pump_floor(void);
 void update_pump_mixing(void);
 void update_blower(void);
 void fsm_update(void);
+bool save_config_to_sd(const furnace_config_t *config);
+bool load_config_from_sd(furnace_config_t *config);
 
 // Wrapper dla config_save_to_nvs (do przekazania callbacku)
 bool config_save_wrapper(void) {
-    return config_save_to_nvs(&config);
+    bool result_nvs = config_save_to_nvs(&config);
+    bool result_sd = save_config_to_sd(&config);
+
+    return result_nvs && result_sd;
 }
+
 
 // ============== FUNKCJE POMOCNICZE ==============
 
@@ -92,6 +98,65 @@ uint8_t interpolate_linear(int16_t value, int16_t min_val, int16_t max_val, uint
 
 uint32_t millis(void) {
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+bool save_config_to_sd(const furnace_config_t *config) {
+    sd_logger_status_t sd_status = sd_logger_get_status();
+
+    // If card is not mounted, return true to avoid false error due to no SD
+    if (sd_status == SD_STATUS_NO_CARD) {
+        ESP_LOGW(TAG, "Cannot save config to SD card - SD card not mounted");
+        return true;
+    }
+
+    if (!sd_logger_is_ready()) {
+        ESP_LOGW(TAG, "Cannot save config to SD card - SD card not ready");
+        return false;
+    }
+    
+    esp_err_t err = sd_logger_save_config(config, sizeof(furnace_config_t));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save config to SD card: %s", esp_err_to_name(err));
+        return false;
+    } else {
+        ESP_LOGI(TAG, "Configuration saved to SD card");
+        return true;
+    }
+}
+
+bool load_config_from_sd(furnace_config_t *config) {
+    if (!sd_logger_is_ready()) {
+        ESP_LOGW(TAG, "Cannot load config form SD card - SD card not ready");
+        return false;
+    }
+    
+    esp_err_t err = sd_logger_load_config(config, sizeof(furnace_config_t));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Configuration loaded from SD card");
+        return true;
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "No configuration file found on SD card");
+    } else {
+        ESP_LOGE(TAG, "Failed to load configuration");
+    }
+    return false;
+}
+
+void on_card_event(bool card_present) {
+    if (card_present) {
+        sd_logger_set_vprintf_handler(true);
+        ESP_LOGI(TAG, "SD card inserted - logging enabled");
+        
+        esp_err_t err = sd_logger_save_config(&config, sizeof(furnace_config_t));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save config to SD card: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Configuration saved to SD card");
+        }
+    } else {
+        sd_logger_set_vprintf_handler(false);
+        ESP_LOGW(TAG, "SD card removed - logging to serial only");
+    }
 }
 
 // ============== LOGIKA POMP ==============
@@ -530,64 +595,6 @@ void mqtt_task(void *pvParameters) {
             ESP_LOGE(TAG, "MQTT Publish failed!");
         }
         
-        // // Pobierz dane do publikacji
-        // xSemaphoreTake(furnace_mutex, portMAX_DELAY);
-        
-        // furnace_state_t state = runtime.current_state;
-        // int16_t temp_furnace = runtime.temp_furnace;
-        // int16_t temp_boiler_top = runtime.temp_boiler_top;
-        // int16_t temp_boiler_bottom = runtime.temp_boiler_bottom;
-        // int16_t temp_main = runtime.temp_main_output;
-        // bool pump_main = runtime.pump_main_on;
-        // bool pump_floor = runtime.pump_floor_on;
-        // uint8_t pump_mixing = runtime.pump_mixing_power;
-        // uint8_t blower = runtime.blower_power;
-        // bool error = runtime.error_flag;
-        
-        // xSemaphoreGive(furnace_mutex);
-        
-        // // Publikuj dane w formacie JSON
-        // snprintf(topic, sizeof(topic), "%s/status", MQTT_BASE_TOPIC);
-        // snprintf(payload, sizeof(payload), 
-        //          "{"
-        //          "\"state\":\"%s\","
-        //          "\"temperatures\":{"
-        //            "\"furnace\":%d,"
-        //            "\"boiler_top\":%d,"
-        //            "\"boiler_bottom\":%d,"
-        //            "\"main_output\":%d"
-        //          "},"
-        //          "\"pumps\":{"
-        //            "\"main\":\"%s\","
-        //            "\"floor\":\"%s\","
-        //            "\"mixing_power\":%d"
-        //          "},"
-        //          "\"blower\":{\"power\":%d},"
-        //          "\"system\":{"
-        //            "\"error\":\"%s\","
-        //            "\"rssi\":%d,"
-        //            "\"heap\":%lu"
-        //          "}"
-        //          "}",
-        //          state_to_string(state),
-        //          temp_furnace, temp_boiler_top, temp_boiler_bottom, temp_main,
-        //          pump_main ? "ON" : "OFF", 
-        //          pump_floor ? "ON" : "OFF",
-        //          pump_mixing,
-        //          blower,
-        //          error ? "ERROR" : "OK",
-        //          wifi_get_rssi(), 
-        //          esp_get_free_heap_size());
-
-        // int msg_id = mqtt_manager_publish(topic, payload, 1, false);
-        
-        // if (msg_id >= 0) {
-        //     ESP_LOGI(TAG, "Published: State=%s, T_furnace=%d°C, msg_id=%d",
-        //              state_to_string(state), temp_furnace, msg_id);
-        // } else {
-        //     ESP_LOGE(TAG, "MQTT Publish failed!");
-        // }
-
         // Co 5 sekund
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5000));
     }
@@ -667,15 +674,38 @@ void app_main(void) {
         nvs_flash_erase();
         err = nvs_flash_init();
     }
-    
-    // Wczytaj konfigurację z NVS lub użyj domyślnej
-    if (!config_load_from_nvs(&config)) {
-        memcpy(&config, &default_config, sizeof(furnace_config_t));
-        config_save_to_nvs(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize NVS!");
+        esp_restart();
     }
 
-    //TODO: Inicjalizacja karty SD i jeśli poprawna, to wczytanie konfiguracji z pliku, a jeśli nie to defaultowej
-    //TODO: Aktywowanie zapisywania logów również do pliku na karcie SD
+    // Inicjalizacja karty SD
+    sd_logger_config_t sd_config = {
+        .cd_pin = GPIO_NUM_33,
+        .enable_card_detect = true,
+        .flush_interval_ms = 30000,
+        .max_file_size_bytes = 10 * 1024 * 1024,
+        .enable_log_rotation = true,    
+        .log_to_serial = true
+    };
+
+    err = sd_logger_init(&sd_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SD Logger initialization failed! Error: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "SD Logger initialized successfully");
+    }
+
+    sd_logger_register_card_event_callback(on_card_event);
+
+    // Wczytywanie konfiguracji z karty SD, NVS lub domyślnej
+    if (!load_config_from_sd(&config)) {
+        if (!config_load_from_nvs(&config)) {
+            memcpy(&config, &default_config, sizeof(furnace_config_t));
+            config_save_to_nvs(&config);
+            sd_logger_save_config(&config, sizeof(furnace_config_t));
+        }
+    }
 
     // Wyświetl aktualną konfigurację
     ESP_LOGI(TAG, "=== Configuration ===");
@@ -703,6 +733,11 @@ void app_main(void) {
     err = wifi_init_sta();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "WiFi initialization failed, will retry in background");
+    }
+
+    if (sd_logger_is_ready()) {
+        sd_logger_set_vprintf_handler(true);
+        ESP_LOGI(TAG, "SD card logging enabled");
     }
     
     // Inicjalizacja GPIO dla pomp ON/OFF
@@ -751,6 +786,7 @@ void app_main(void) {
     runtime.current_state = STATE_IDLE;
     runtime.state_entry_time = millis();
     runtime.last_blowthrough_time = millis();
+    runtime.last_fsm_update_time = millis();
     runtime.last_cooling_alert_time = 0;
     runtime.temp_history_index = 0;
     
@@ -769,7 +805,7 @@ void app_main(void) {
     // Tworzenie tasków
     BaseType_t result;
     
-    result = xTaskCreatePinnedToCore(sensor_task, "Sensors", 2048, NULL, 8, NULL, 0);
+    result = xTaskCreatePinnedToCore(sensor_task, "Sensors", 4096, NULL, 8, NULL, 0);
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create Sensors task!");
         esp_restart();
@@ -787,7 +823,7 @@ void app_main(void) {
         esp_restart();
     }
     
-    result = xTaskCreatePinnedToCore(mqtt_task, "MQTT", 4096, NULL, 3, NULL, 1);
+    result = xTaskCreatePinnedToCore(mqtt_task, "MQTT", 8192, NULL, 3, NULL, 1);
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create MQTT task!");
         esp_restart();

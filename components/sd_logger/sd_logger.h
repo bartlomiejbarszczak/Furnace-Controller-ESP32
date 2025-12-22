@@ -30,8 +30,8 @@ extern "C" {
 #define SD_LOG_BUFFER_SIZE 2048        // Internal buffer size (bytes)
 #define SD_LOG_FLUSH_INTERVAL_MS 30000 // Auto-flush every 30 seconds
 #define SD_LOG_MAX_FILE_SIZE_MB 10     // Rotate log file after 10 MB
-#define SD_LOG_FILE_PATH "0:/furnace_log.txt"     // FatFs path format
-#define SD_CONFIG_FILE_PATH "0:/furnace_config.bin"
+#define SD_LOG_FILE_PATH "0:/furnace_log.txt"       // FatFs path format
+#define SD_CONFIG_FILE_PATH "0:/furnace_config.bin" // Config file path
 
 // ============== TYPES ==============
 

@@ -95,15 +95,20 @@ static esp_err_t sd_mount_card(void) {
     
     ESP_LOGI(TAG, "Mounting SD card with FatFs...");
     
-    // Initialize SDMMC host
+    // Configure SDMMC host with proper settings
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.flags = SDMMC_HOST_FLAG_1BIT;  // Use 1-bit mode
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT >> 1;
     
-    // Configure 1-bit mode
+    // Configure slot BEFORE initialization with custom pins
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 1;  // 1-bit mode
+    slot_config.clk = GPIO_NUM_14;
+    slot_config.cmd = GPIO_NUM_15;
+    slot_config.d0  = GPIO_NUM_2;
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
     
-    // Initialize slot
+    // Initialize SDMMC host with proper error handling
     esp_err_t ret = sdmmc_host_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SDMMC host init failed: %s", esp_err_to_name(ret));
@@ -111,10 +116,11 @@ static esp_err_t sd_mount_card(void) {
         return ret;
     }
     
+    // Initialize slot with our configuration
     ret = sdmmc_host_init_slot(host.slot, &slot_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SDMMC slot init failed: %s", esp_err_to_name(ret));
-        sdmmc_host_deinit();
+        sdmmc_host_deinit();  // Clean up host
         ctx.stats.error_count++;
         return ret;
     }
@@ -129,15 +135,23 @@ static esp_err_t sd_mount_card(void) {
         }
     }
     
+    // Clear card structure
+    memset(ctx.card, 0, sizeof(sdmmc_card_t));
+    
     // Probe and initialize card
     ret = sdmmc_card_init(&host, ctx.card);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Card init failed: %s", esp_err_to_name(ret));
+        free(ctx.card);
+        ctx.card = NULL;
         sdmmc_host_deinit();
         ctx.stats.error_count++;
         return ret;
     }
-        
+    
+    // Log card info
+    sdmmc_card_print_info(stdout, ctx.card);
+    
     // Register diskio driver
     ff_diskio_register_sdmmc(0, ctx.card);
     
@@ -146,6 +160,8 @@ static esp_err_t sd_mount_card(void) {
         ctx.fs = (FATFS*)malloc(sizeof(FATFS));
         if (ctx.fs == NULL) {
             ESP_LOGE(TAG, "Failed to allocate FATFS structure");
+            free(ctx.card);
+            ctx.card = NULL;
             sdmmc_host_deinit();
             return ESP_ERR_NO_MEM;
         }
@@ -155,6 +171,11 @@ static esp_err_t sd_mount_card(void) {
     FRESULT fres = f_mount(ctx.fs, "0:", 1);  // "0:" = drive number, 1 = mount now
     if (fres != FR_OK) {
         ESP_LOGE(TAG, "FatFs mount failed: %d", fres);
+        free(ctx.fs);
+        ctx.fs = NULL;
+        free(ctx.card);
+        ctx.card = NULL;
+        ff_diskio_register_sdmmc(0, NULL);  // Unregister
         sdmmc_host_deinit();
         ctx.stats.error_count++;
         return ESP_FAIL;
@@ -188,10 +209,17 @@ static esp_err_t sd_unmount_card(void) {
         ctx.fs = NULL;
     }
     
-    // Deinitialize SDMMC
-    sdmmc_host_deinit();
+    // Unregister diskio
+    ff_diskio_register_sdmmc(0, NULL);
     
-    // Note: Don't free ctx.card here, we'll reuse it
+    // Free card structure
+    if (ctx.card) {
+        free(ctx.card);
+        ctx.card = NULL;
+    }
+    
+    // Deinitialize SDMMC host
+    sdmmc_host_deinit();
     
     ctx.status = SD_STATUS_NO_CARD;
     ESP_LOGI(TAG, "SD card unmounted");
@@ -213,8 +241,7 @@ static esp_err_t sd_open_log_file(void) {
     
     // Open file in append mode (FA_OPEN_APPEND | FA_WRITE | FA_READ)
     // If file doesn't exist, create it (FA_OPEN_ALWAYS)
-    FRESULT fres = f_open(&ctx.log_file, SD_LOG_FILE_PATH, 
-                          FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
+    FRESULT fres = f_open(&ctx.log_file, SD_LOG_FILE_PATH, FA_WRITE | FA_OPEN_APPEND);
     
     if (fres != FR_OK) {
         ESP_LOGE(TAG, "Failed to open log file: %d", fres);
@@ -222,14 +249,14 @@ static esp_err_t sd_open_log_file(void) {
         return ESP_FAIL;
     }
     
-    // Seek to end of file for append
-    fres = f_lseek(&ctx.log_file, f_size(&ctx.log_file));
-    if (fres != FR_OK) {
-        ESP_LOGE(TAG, "Failed to seek to end: %d", fres);
-        f_close(&ctx.log_file);
-        ctx.stats.error_count++;
-        return ESP_FAIL;
-    }
+    // // Seek to end of file for append
+    // fres = f_lseek(&ctx.log_file, f_size(&ctx.log_file));
+    // if (fres != FR_OK) {
+    //     ESP_LOGE(TAG, "Failed to seek to end: %d", fres);
+    //     f_close(&ctx.log_file);
+    //     ctx.stats.error_count++;
+    //     return ESP_FAIL;
+    // }
     
     ctx.log_file_open = true;
     ctx.stats.current_file_size = f_size(&ctx.log_file);
@@ -270,18 +297,22 @@ static esp_err_t sd_flush_buffer_internal(void) {
         return ESP_ERR_INVALID_STATE;
     }
     
+    // xSemaphoreTake(ctx.mutex, portMAX_DELAY);
+    
     // Write buffer to file
     UINT bytes_written;
     FRESULT fres = f_write(&ctx.log_file, ctx.write_buffer, ctx.buffer_pos, &bytes_written);
     
+    // xSemaphoreGive(ctx.mutex);
+    
     if (fres != FR_OK || bytes_written != ctx.buffer_pos) {
-        ESP_LOGE(TAG, "Write error: expected %d, wrote %d, result=%d", 
-                 ctx.buffer_pos, bytes_written, fres);
+        ESP_LOGE(TAG, "Write error: expected %d, wrote %d, result=%d. Error code: %d", 
+                 ctx.buffer_pos, bytes_written, fres, fres);
         ctx.stats.error_count++;
         return ESP_FAIL;
     }
     
-    // *** CRITICAL: Use f_sync() to ensure data is written to physical storage ***
+    // Sync to ensure data is physically written
     fres = f_sync(&ctx.log_file);
     if (fres != FR_OK) {
         ESP_LOGE(TAG, "f_sync failed: %d", fres);
@@ -309,36 +340,39 @@ static esp_err_t sd_flush_buffer_internal(void) {
  * @brief Custom vprintf for ESP-IDF logging integration
  */
 static int custom_vprintf(const char *fmt, va_list args) {
-    // Always print to serial
+    // Always print to serial first
+    int ret = 0;
     if (ctx.original_vprintf) {
-        ctx.original_vprintf(fmt, args);
+        ret = ctx.original_vprintf(fmt, args);
     }
     
     // Also write to SD card if available
     if (ctx.status == SD_STATUS_MOUNTED && ctx.log_file_open) {
-        va_list args_copy;
-        va_copy(args_copy, args);
-        
-        xSemaphoreTake(ctx.mutex, portMAX_DELAY);
-        
-        int remaining = SD_LOG_BUFFER_SIZE - ctx.buffer_pos;
-        int written = vsnprintf(&ctx.write_buffer[ctx.buffer_pos], remaining, fmt, args_copy);
-        
-        if (written > 0 && written < remaining) {
-            ctx.buffer_pos += written;
-            ctx.stats.total_writes++;
+        // Don't block - use tryTake instead of Take
+        if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            va_list args_copy;
+            va_copy(args_copy, args);
             
-            // Flush if buffer is getting full (>75%)
-            if (ctx.buffer_pos > (SD_LOG_BUFFER_SIZE * 3 / 4)) {
-                sd_flush_buffer_internal();
+            int remaining = SD_LOG_BUFFER_SIZE - ctx.buffer_pos;
+            int written = vsnprintf(&ctx.write_buffer[ctx.buffer_pos], remaining, fmt, args_copy);
+            
+            if (written > 0 && written < remaining) {
+                ctx.buffer_pos += written;
+                ctx.stats.total_writes++;
+                
+                // Flush if buffer is getting full (>75%)
+                if (ctx.buffer_pos > (SD_LOG_BUFFER_SIZE * 3 / 4)) {
+                    sd_flush_buffer_internal();
+                }
             }
+            
+            xSemaphoreGive(ctx.mutex);
+            va_end(args_copy);
         }
-        
-        xSemaphoreGive(ctx.mutex);
-        va_end(args_copy);
+        // If mutex not available, skip SD write (don't block)
     }
     
-    return 0;
+    return ret;
 }
 
 /**
@@ -347,9 +381,10 @@ static int custom_vprintf(const char *fmt, va_list args) {
  * Polls CD pin and handles card insertion/removal events
  */
 static void sd_card_monitor_task(void *pvParameters) {
-    bool last_card_state = false;
+    bool last_card_state = is_card_present();
     
-    ESP_LOGI(TAG, "Card monitor task started");
+    ESP_LOGI(TAG, "Card monitor task started (initial state: %s)", 
+             last_card_state ? "PRESENT" : "ABSENT");
     
     while (1) {
         bool card_now = is_card_present();
@@ -367,6 +402,9 @@ static void sd_card_monitor_task(void *pvParameters) {
             xSemaphoreTake(ctx.mutex, portMAX_DELAY);
             
             if (card_now) {
+                // Wait for card to stabilize after insertion
+                vTaskDelay(pdMS_TO_TICKS(200));
+                
                 // Card inserted - try to mount
                 ctx.status = SD_STATUS_CARD_DETECTED;
                 
@@ -468,6 +506,7 @@ esp_err_t sd_logger_init(const sd_logger_config_t *config) {
         }
     } else {
         ctx.status = SD_STATUS_NO_CARD;
+        ESP_LOGI(TAG, "No SD card detected at startup");
     }
     
     // Create monitoring task
@@ -491,7 +530,7 @@ esp_err_t sd_logger_init(const sd_logger_config_t *config) {
         result = xTaskCreate(
             sd_flush_task,
             "sd_flush",
-            2048,
+            4096,
             NULL,
             4,
             &ctx.flush_task
