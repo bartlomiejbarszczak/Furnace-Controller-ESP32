@@ -12,10 +12,6 @@
 
 static const char *TAG = "WiFi_Manager";
 
-// Default WiFi credentials (fallback if nothing in NVS)
-#define DEFAULT_WIFI_SSID      "DziwneJaja"
-#define DEFAULT_WIFI_PASSWORD  "Haslo123#@!"
-
 // Event group for WiFi events
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -291,11 +287,8 @@ esp_err_t wifi_init_sta(void)
     char password[64];
     
     if (wifi_load_credentials(ssid, password) != ESP_OK) {
-        ESP_LOGW(TAG, "No WiFi credentials in NVS, using defaults");
-        strncpy(ssid, DEFAULT_WIFI_SSID, sizeof(ssid) - 1);
-        strncpy(password, DEFAULT_WIFI_PASSWORD, sizeof(password) - 1);
-        ssid[sizeof(ssid) - 1] = '\0';
-        password[sizeof(password) - 1] = '\0';
+        ESP_LOGW(TAG, "No WiFi credentials in NVS");
+        return ESP_ERR_NOT_FOUND;
     }
     
     ESP_LOGI(TAG, "Connecting to SSID: %s", ssid);

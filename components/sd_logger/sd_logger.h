@@ -30,8 +30,9 @@ extern "C" {
 #define SD_LOG_BUFFER_SIZE 2048        // Internal buffer size (bytes)
 #define SD_LOG_FLUSH_INTERVAL_MS 30000 // Auto-flush every 30 seconds
 #define SD_LOG_MAX_FILE_SIZE_MB 10     // Rotate log file after 10 MB
-#define SD_LOG_FILE_PATH "0:/furnace_log.txt"       // FatFs path format
-#define SD_CONFIG_FILE_PATH "0:/furnace_config.bin" // Config file path
+#define SD_LOG_FILE_PATH "0:/furnace_log.txt"           // FatFs path format
+#define SD_CONFIG_FILE_PATH "0:/furnace_config.bin"     // Config file path
+#define SD_WIFI_CONFIG_FILE_PATH "0:/wifi.conf"   // WiFi config file path
 
 // ============== TYPES ==============
 
@@ -161,6 +162,35 @@ esp_err_t sd_logger_save_config(const void *config_data, size_t size);
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist
  */
 esp_err_t sd_logger_load_config(void *config_data, size_t size);
+
+/**
+ * @brief Save WiFi configuration data to SD card
+ * 
+ * Writes WiFi SSID and password to dedicated config file.
+ * Thread-safe.
+ * 
+ * @param ssid WiFi SSID
+ * @param ssid_len Length of SSID string
+ * @param password WiFi password
+ * @param password_len Length of password string
+ * @return ESP_OK on success
+ */
+esp_err_t sd_logger_save_wifi_config(const char *ssid, size_t ssid_len, const char *password, size_t password_len);
+
+
+/**
+ * @brief Load WiFi configuration data from SD card
+ * 
+ * Reads WiFi SSID and password from config file.
+ * Thread-safe.
+ * 
+ * @param ssid Buffer to store SSID (min 32 bytes)
+ * @param ssid_len Size of SSID buffer
+ * @param password Buffer to store password (min 64 bytes)
+ * @param password_len Size of password buffer
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND if file doesn't exist
+ */
+esp_err_t sd_logger_load_wifi_config(char *ssid, size_t ssid_len, char *password, size_t password_len);
 
 /**
  * @brief Get SD logger statistics

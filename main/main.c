@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 
 #include "furnace_config.h"
 #include "mqtt_manager.h"
@@ -27,6 +28,8 @@ static furnace_config_t config;
 static furnace_runtime_t runtime = {0};
 static SemaphoreHandle_t furnace_mutex;
 static ds18b20_sensor_t temp_sensors[NUM_TEMP_SENSORS];
+static char wifi_ssid[32];
+static char wifi_password[64];
 
 // ============== PROTOTYPY ==============
 void set_pump_main(bool state);
@@ -44,6 +47,9 @@ void update_blower(void);
 void fsm_update(void);
 bool save_config_to_sd(const furnace_config_t *config);
 bool load_config_from_sd(furnace_config_t *config);
+bool save_wifi_config_to_sd(const char *ssid, const size_t ssid_len, const char *password, const size_t password_len);
+bool load_wifi_config_from_sd(char *ssid, size_t ssid_size, char *password, size_t password_size);
+void initialize_time(void);
 
 // Wrapper dla config_save_to_nvs (do przekazania callbacku)
 bool config_save_wrapper(void) {
@@ -142,6 +148,51 @@ bool load_config_from_sd(furnace_config_t *config) {
     return false;
 }
 
+
+bool save_wifi_config_to_sd(const char *ssid, const size_t ssid_len, const char *password, const size_t password_len) {
+    sd_logger_status_t sd_status = sd_logger_get_status();
+
+    // If card is not mounted, return to avoid false error due to no SD
+    if (sd_status == SD_STATUS_NO_CARD) {
+        ESP_LOGW(TAG, "Cannot save WiFi config to SD card - SD card not mounted");
+        return false;
+    }
+
+    if (!sd_logger_is_ready()) {
+        ESP_LOGW(TAG, "Cannot save WiFi config to SD card - SD card not ready");
+        return false;
+    }
+    
+    esp_err_t err = sd_logger_save_wifi_config(ssid, ssid_len, password, password_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save WiFi config to SD card: %s", esp_err_to_name(err));
+        return false;
+    } else {
+        ESP_LOGI(TAG, "WiFi configuration saved to SD card");
+        return true;
+    }
+}
+
+
+bool load_wifi_config_from_sd(char *ssid, size_t ssid_size, char *password, size_t password_size) {
+    if (!sd_logger_is_ready()) {
+        ESP_LOGW(TAG, "Cannot load WiFi config from SD card - SD card not ready");
+        return false;
+    }
+    
+    esp_err_t err = sd_logger_load_wifi_config(ssid, ssid_size, password, password_size);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "WiFi configuration loaded from SD card");
+        return true;
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "No WiFi configuration file found on SD card");
+    } else {
+        ESP_LOGE(TAG, "Failed to load WiFi configuration from SD card: %s", esp_err_to_name(err));
+    }
+    return false;
+}
+
+
 void on_card_event(bool card_present) {
     if (card_present) {
         sd_logger_set_vprintf_handler(true);
@@ -153,10 +204,39 @@ void on_card_event(bool card_present) {
         } else {
             ESP_LOGI(TAG, "Configuration saved to SD card");
         }
+
+        err = sd_logger_save_wifi_config(wifi_ssid, strlen(wifi_ssid), wifi_password, strlen(wifi_password));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save WiFi config to SD card: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "WiFi configuration saved to SD card");
+        }
+
     } else {
         sd_logger_set_vprintf_handler(false);
         ESP_LOGW(TAG, "SD card removed - logging to serial only");
     }
+}
+
+void initialize_time(void) {
+    ESP_LOGI(TAG, "Initializing SNTP for Warsaw...");
+
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "tempus1.gum.gov.pl");
+    esp_sntp_setservername(1, "pool.ntp.org");
+    esp_sntp_init();
+
+    int retry = 0;
+    const int retry_count = 10;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+
+    ESP_LOGI(TAG, "Time synchronization finished.");
 }
 
 // ============== LOGIKA POMP ==============
@@ -730,9 +810,31 @@ void app_main(void) {
 
     // Inicjalizacja WiFi
     ESP_LOGI(TAG, "Initializing WiFi...");
-    err = wifi_init_sta();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi initialization failed, will retry in background");
+    
+    // Wczytywanie danych konfiguracyjnych WiFi
+    if (!load_wifi_config_from_sd(wifi_ssid, sizeof(wifi_ssid), wifi_password, sizeof(wifi_password))) {
+        // Jeśli brak na karcie SD, to z NVS
+        err = wifi_load_credentials(wifi_ssid, wifi_password);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Loaded WiFi credentials: SSID='%s'", wifi_ssid);
+            if (save_wifi_config_to_sd(wifi_ssid, strlen(wifi_ssid), wifi_password, strlen(wifi_password))) {
+                ESP_LOGI(TAG, "WiFi credentials loaded from NVS saved to SD card");
+            } else {
+                ESP_LOGW(TAG, "Failed to save loaded from NVS WiFi credentials to SD card");
+            }
+        } else {
+            ESP_LOGW(TAG, "No WiFi credentials found");
+            vTaskDelay(pdMS_TO_TICKS(10000000));
+            //TODO: Start AP mode for configuration
+        }
+    }
+
+    err = wifi_init_sta_with_credentials(wifi_ssid, wifi_password);
+    if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "WiFi initialization failed, restarting");
+        esp_restart();
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi initialization failed, will retry in background. Error: %s", esp_err_to_name(err));
     }
 
     if (sd_logger_is_ready()) {
@@ -740,6 +842,9 @@ void app_main(void) {
         ESP_LOGI(TAG, "SD card logging enabled");
     }
     
+    // Inicjalizacja czasu
+    initialize_time();
+
     // Inicjalizacja GPIO dla pomp ON/OFF
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << config.pin_pump_main) | (1ULL << config.pin_pump_floor),

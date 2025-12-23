@@ -98,7 +98,7 @@ static esp_err_t sd_mount_card(void) {
     // Configure SDMMC host with proper settings
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;  // Use 1-bit mode
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT >> 1;
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT >> 2;
     
     // Configure slot BEFORE initialization with custom pins
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -755,6 +755,109 @@ esp_err_t sd_logger_load_config(void *config_data, size_t size) {
     }
     
     ESP_LOGI(TAG, "Configuration loaded (%d bytes)", size);
+    return ESP_OK;
+}
+
+esp_err_t sd_logger_save_wifi_config(const char *ssid, size_t ssid_len, const char *password, size_t password_len) 
+{
+    if (ssid == NULL || ssid_len == 0 || password == NULL || password_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (!sd_logger_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    xSemaphoreTake(ctx.mutex, portMAX_DELAY);
+    
+    FIL wifi_file;
+    FRESULT fres = f_open(&wifi_file, SD_WIFI_CONFIG_FILE_PATH, FA_WRITE | FA_CREATE_ALWAYS);
+    
+    if (fres != FR_OK) {
+        ESP_LOGE(TAG, "Failed to open WiFi config file for writing: %d", fres);
+        xSemaphoreGive(ctx.mutex);
+        return ESP_FAIL;
+    }
+    
+    char ssid_buffer[64] = {0};
+    char password_buffer[128] = {0};
+
+    snprintf(ssid_buffer, sizeof(ssid_buffer), "ssid=%s\n", ssid);
+    snprintf(password_buffer, sizeof(password_buffer), "password=%s\n", password);
+
+    UINT bytes_written;
+    fres = f_write(&wifi_file, ssid_buffer, strlen(ssid_buffer), &bytes_written);
+    if (fres != FR_OK || bytes_written != strlen(ssid_buffer)) {
+        ESP_LOGE(TAG, "WiFi SSID write failed: %d/%d bytes, result=%d",
+                 bytes_written, strlen(ssid_buffer), fres);
+        f_close(&wifi_file);
+        xSemaphoreGive(ctx.mutex);
+        return ESP_FAIL;
+    }
+    
+    fres = f_write(&wifi_file, password, password_len, &bytes_written);
+    if (fres != FR_OK || bytes_written != password_len) {
+        ESP_LOGE(TAG, "WiFi password write failed: %d/%d bytes, result=%d", 
+                 bytes_written, password_len, fres);
+        f_close(&wifi_file);
+        xSemaphoreGive(ctx.mutex);
+        return ESP_FAIL;
+    }
+    
+    // Sync to ensure data is written
+    f_sync(&wifi_file);
+    
+    f_close(&wifi_file);
+    
+    xSemaphoreGive(ctx.mutex);
+    
+    ESP_LOGI(TAG, "WiFi configuration saved (SSID: %d bytes, Password: %d bytes)", 
+             ssid_len, password_len);
+    return ESP_OK;
+}
+
+esp_err_t sd_logger_load_wifi_config(char *ssid, size_t ssid_size, char *password, size_t password_size) 
+{
+    if (ssid == NULL || ssid_size == 0 || password == NULL || password_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (ctx.status != SD_STATUS_MOUNTED) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    xSemaphoreTake(ctx.mutex, portMAX_DELAY);
+    
+    FIL wifi_file;
+    FRESULT fres = f_open(&wifi_file, SD_WIFI_CONFIG_FILE_PATH, FA_READ);
+    
+    if (fres != FR_OK) {
+        xSemaphoreGive(ctx.mutex);
+        return (fres == FR_NO_FILE) ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    
+    char line[128];
+    while (f_gets(line, sizeof(line), &wifi_file)) {
+        if (strncmp(line, "ssid=", 5) == 0) {
+            strncpy(ssid, line + 5, ssid_size - 1);
+            ssid[ssid_size - 1] = '\0';
+            // Remove newline
+            char *newline = strchr(ssid, '\n');
+            if (newline) *newline = '\0';
+        } else if (strncmp(line, "password=", 9) == 0) {
+            strncpy(password, line + 9, password_size - 1);
+            password[password_size - 1] = '\0';
+            // Remove newline
+            char *newline = strchr(password, '\n');
+            if (newline) *newline = '\0';
+        }
+    }
+    
+    f_close(&wifi_file);
+    
+    xSemaphoreGive(ctx.mutex);
+    
+    ESP_LOGI(TAG, "WiFi configuration loaded (SSID: %s)", ssid);
     return ESP_OK;
 }
 
