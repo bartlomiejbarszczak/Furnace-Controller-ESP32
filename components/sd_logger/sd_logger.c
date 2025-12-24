@@ -794,11 +794,11 @@ esp_err_t sd_logger_save_wifi_config(const char *ssid, size_t ssid_len, const ch
         xSemaphoreGive(ctx.mutex);
         return ESP_FAIL;
     }
-    
-    fres = f_write(&wifi_file, password, password_len, &bytes_written);
-    if (fres != FR_OK || bytes_written != password_len) {
+
+    fres = f_write(&wifi_file, password_buffer, strlen(password_buffer), &bytes_written);
+    if (fres != FR_OK || bytes_written != strlen(password_buffer)) {
         ESP_LOGE(TAG, "WiFi password write failed: %d/%d bytes, result=%d", 
-                 bytes_written, password_len, fres);
+                 bytes_written, strlen(password_buffer), fres);
         f_close(&wifi_file);
         xSemaphoreGive(ctx.mutex);
         return ESP_FAIL;

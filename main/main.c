@@ -83,6 +83,7 @@ bool is_temp_rising(void) {
 
     // Jeśli różnica między max a min jest większa niż 4°C, uznajemy że temp rośnie
     if ((max_temp - min_temp) >= 4) {
+        ESP_LOGI(TAG, "Temperature rising detected (max: %d, min: %d)", max_temp, min_temp);
         return true;
     } else {
         return false;
@@ -447,6 +448,12 @@ void fsm_update(void) {
                 next_state = STATE_WORK;
                 runtime.last_blowthrough_time = millis();
             }
+
+            // → Wygaszanie: żadanie manualne
+            else if (runtime.manual_shutdown_requested) {
+                next_state = STATE_SHUTDOWN;
+                runtime.manual_shutdown_requested = false;
+            }
             break;
             
         case STATE_WORK:
@@ -508,8 +515,9 @@ void fsm_update(void) {
                 next_state = STATE_IDLE;
             }
             // → Rozpalanie: temp rośnie
-            else if (is_temp_rising()) {
+            else if (is_temp_rising() || runtime.manual_ignition_requested) {
                 next_state = STATE_IGNITION;
+                runtime.manual_ignition_requested = false;
             }
             break;
             
@@ -577,6 +585,12 @@ void sensor_task(void *pvParameters) {
         
         if (success < NUM_TEMP_SENSORS) {
             ESP_LOGW(TAG, "Only %d/%d sensors read successfully", success, NUM_TEMP_SENSORS);
+            
+            ESP_LOGI(TAG, "Sensor temps: ");
+            for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
+                ESP_LOGI(TAG, "Sensor %d: %.2f°C", i, temperatures[i]);
+            }
+
         }
 
         xSemaphoreTake(furnace_mutex, portMAX_DELAY);
@@ -610,7 +624,14 @@ void temp_furnace_history_task(void *pvParameters) {
         runtime.temp_furnace_history[runtime.temp_history_index] = runtime.temp_furnace;
         runtime.temp_history_index = (runtime.temp_history_index + 1) % BUFFER_SIZE;
         
+        ESP_LOGI(TAG, "Temperatures: %d, %d, %d, %d, %d", 
+                runtime.temp_furnace_history[0],
+                runtime.temp_furnace_history[1],
+                runtime.temp_furnace_history[2],
+                runtime.temp_furnace_history[3],
+                runtime.temp_furnace_history[4]);
         xSemaphoreGive(furnace_mutex);
+        
         
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(60 * 1000));
     }
@@ -635,6 +656,7 @@ void mqtt_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     char topic[96];
     char payload[512];
+    uint32_t send_count = 0;
     
     ESP_LOGI(TAG, "MQTT Task started, waiting for WiFi...");
     
@@ -643,19 +665,43 @@ void mqtt_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    // Inicjalizacja MQTT
-    esp_err_t err = mqtt_manager_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize MQTT manager");
-        vTaskDelete(NULL);
-        return;
+    // Inicjalizacja MQTT z retry loop (mDNS discovery)
+    ESP_LOGI(TAG, "WiFi connected, searching for MQTT broker...");
+    esp_err_t err;
+    while ((err = mqtt_manager_init()) != ESP_OK) {
+        ESP_LOGW(TAG, "MQTT init failed (broker not found), retrying in 10s...");
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        
+        // Sprawdź czy WiFi dalej działa
+        if (!wifi_is_connected()) {
+            ESP_LOGW(TAG, "WiFi disconnected during MQTT init, waiting...");
+            while (!wifi_is_connected()) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            ESP_LOGI(TAG, "WiFi reconnected, resuming MQTT broker search...");
+        }
     }
     
+    ESP_LOGI(TAG, "MQTT initialized successfully");
+    
     while (1) {
-        // Sprawdź połączenie WiFi
+        // Sprawdź czy WiFi jest połączone
         if (!wifi_is_connected()) {
             ESP_LOGW(TAG, "WiFi not connected, waiting...");
             vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        
+        // Sprawdź czy potrzebne jest ponowne wyszukanie brokera
+        if (mqtt_manager_needs_rediscovery()) {
+            ESP_LOGI(TAG, "Broker rediscovery needed, searching...");
+            err = mqtt_manager_rediscover_broker();
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Broker rediscovered successfully");
+            } else {
+                ESP_LOGW(TAG, "Broker rediscovery failed, will retry in 10s");
+                vTaskDelay(pdMS_TO_TICKS(10000));
+            }
             continue;
         }
         
@@ -670,7 +716,9 @@ void mqtt_task(void *pvParameters) {
         int msg_id = mqtt_manager_publish_status(topic, payload, sizeof(topic), sizeof(payload));
 
         if (msg_id >= 0) {
-            ESP_LOGI(TAG, "Published: msg_id=%d", msg_id);
+            if (send_count++ % 20 == 0) {
+                ESP_LOGI(TAG, "Published: msg_id=%d", msg_id);
+            }
         } else {
             ESP_LOGE(TAG, "MQTT Publish failed!");
         }

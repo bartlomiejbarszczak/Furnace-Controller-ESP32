@@ -6,12 +6,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include "mdns.h"
 
 static const char *TAG = "MQTT_Manager";
 
 // MQTT client handle
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static bool mqtt_connected = false;
+
+// mDNS and broker discovery
+static bool mdns_initialized = false;
+static char *current_broker_uri = NULL;
+static uint8_t reconnect_attempt = 0;
+static bool rediscover_broker_flag = false;
 
 // External data sources (set by main application)
 static furnace_config_t *furnace_config = NULL;
@@ -29,12 +36,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 static bool apply_config_from_json(const char* json_str, int json_len);
 static bool apply_single_config(furnace_config_t *cfg, const char *key, cJSON *value, int *changes);
 static void create_message_payload(char *buffer, size_t buffer_size, const char *command, const char *status, const char *message);
-
-// // Helper function to compare MQTT data
-// static bool mqtt_data_equals(esp_mqtt_event_handle_t event, const char* expected) {
-//     size_t expected_len = strlen(expected);
-//     return (event->data_len == expected_len && strncmp(event->data, expected, expected_len) == 0);
-// }
+static char* mqtt_discover_broker(void);
 
 // Set data sources
 void mqtt_manager_set_data_sources(void *cfg, void *rt, void *mutex) {
@@ -54,6 +56,66 @@ void mqtt_manager_set_config_save_callback(bool (*save_fn)(void)) {
     config_save_fn = save_fn;
 }
 
+// Discover MQTT broker via mDNS
+static char* mqtt_discover_broker(void) {
+    // Initialize mDNS if not already done
+    if (!mdns_initialized) {
+        esp_err_t err = mdns_init();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize mDNS: %s", esp_err_to_name(err));
+            return NULL;
+        }
+        
+        mdns_hostname_set("furnace-esp32");
+        mdns_instance_name_set("Furnace Controller");
+        mdns_initialized = true;
+        ESP_LOGI(TAG, "mDNS initialized");
+    }
+    
+    ESP_LOGI(TAG, "Searching for MQTT broker via mDNS...");
+    
+    mdns_result_t *results = NULL;
+    esp_err_t err = mdns_query_ptr("_mqtt", "_tcp", 3000, 20, &results);
+    
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mDNS query failed: %s", esp_err_to_name(err));
+        return NULL;
+    }
+    
+    if (results == NULL) {
+        ESP_LOGW(TAG, "No MQTT brokers found via mDNS");
+        return NULL;
+    }
+    
+    // Process first result
+    mdns_result_t *r = results;
+    mdns_ip_addr_t *a = r->addr;
+    char *broker_uri = NULL;
+    
+    while (a) {
+        if (a->addr.type == ESP_IPADDR_TYPE_V4) {
+            ESP_LOGI(TAG, "Found MQTT broker:");
+            ESP_LOGI(TAG, "  Hostname: %s", r->hostname ? r->hostname : "N/A");
+            ESP_LOGI(TAG, "  Instance: %s", r->instance_name ? r->instance_name : "N/A");
+            ESP_LOGI(TAG, "  IPv4: " IPSTR, IP2STR(&(a->addr.u_addr.ip4)));
+            ESP_LOGI(TAG, "  Port: %d", r->port);
+            
+            // Allocate memory for URI string
+            broker_uri = malloc(64);
+            if (broker_uri != NULL) {
+                snprintf(broker_uri, 64, "mqtt://" IPSTR ":%d",
+                        IP2STR(&(a->addr.u_addr.ip4)), r->port);
+                ESP_LOGI(TAG, "Broker URI: %s", broker_uri);
+            }
+            break;
+        }
+        a = a->next;
+    }
+    
+    mdns_query_results_free(results);
+    return broker_uri;
+}
+
 // Initialize MQTT
 esp_err_t mqtt_manager_init(void) {
     if (furnace_config == NULL || furnace_runtime == NULL || data_mutex == NULL) {
@@ -61,8 +123,22 @@ esp_err_t mqtt_manager_init(void) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    // Discover broker via mDNS
+    char *broker_uri = mqtt_discover_broker();
+    
+    if (broker_uri == NULL) {
+        ESP_LOGW(TAG, "Broker not found via mDNS");
+        return ESP_ERR_NOT_FOUND;
+    }
+    
+    // Save URI globally for reconnection
+    if (current_broker_uri != NULL) {
+        free(current_broker_uri);
+    }
+    current_broker_uri = broker_uri;
+
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
+        .broker.address.uri = current_broker_uri,
         .session.last_will.topic = LWT_TOPIC,
         .session.last_will.msg = LWT_PAYLOAD_OFFLINE,
         .session.last_will.msg_len = strlen(LWT_PAYLOAD_OFFLINE),
@@ -86,8 +162,89 @@ esp_err_t mqtt_manager_init(void) {
         return err;
     }
     
-    ESP_LOGI(TAG, "MQTT client started");
+    ESP_LOGI(TAG, "MQTT client started with broker: %s", current_broker_uri);
     return ESP_OK;
+}
+
+// Check if broker rediscovery is needed
+bool mqtt_manager_needs_rediscovery(void) {
+    return rediscover_broker_flag;
+}
+
+// Perform broker rediscovery (call from external task, not from event handler)
+esp_err_t mqtt_manager_rediscover_broker(void) {
+    if (!rediscover_broker_flag) {
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Starting broker rediscovery via mDNS...");
+    
+    // Stop and destroy old client
+    if (mqtt_client != NULL) {
+        esp_mqtt_client_stop(mqtt_client);
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = NULL;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Find broker again via mDNS
+    char *new_broker_uri = mqtt_discover_broker();
+    
+    if (new_broker_uri == NULL) {
+        ESP_LOGW(TAG, "Broker not found via mDNS during rediscovery");
+        rediscover_broker_flag = false;  // Clear flag to try again later
+        return ESP_ERR_NOT_FOUND;
+    }
+    
+    if (current_broker_uri != NULL) {
+        free(current_broker_uri);
+    }
+    current_broker_uri = new_broker_uri;
+    
+    // Create new MQTT client with new URI
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = current_broker_uri,
+        .session.last_will.topic = LWT_TOPIC,
+        .session.last_will.msg = LWT_PAYLOAD_OFFLINE,
+        .session.last_will.msg_len = strlen(LWT_PAYLOAD_OFFLINE),
+        .session.last_will.qos = 1,
+        .session.last_will.retain = true,
+        .session.keepalive = 15,
+    };
+    
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (mqtt_client == NULL) {
+        ESP_LOGE(TAG, "Failed to create new MQTT client");
+        rediscover_broker_flag = false;
+        return ESP_FAIL;
+    }
+    
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, 
+                                  mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+    
+    ESP_LOGI(TAG, "Reconnecting to newly discovered broker: %s", current_broker_uri);
+    rediscover_broker_flag = false;
+    
+    return ESP_OK;
+}
+void mqtt_manager_deinit(void) {
+    if (mqtt_client != NULL) {
+        esp_mqtt_client_stop(mqtt_client);
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = NULL;
+    }
+    
+    if (current_broker_uri != NULL) {
+        free(current_broker_uri);
+        current_broker_uri = NULL;
+    }
+    
+    mqtt_connected = false;
+    reconnect_attempt = 0;
+    
+    ESP_LOGI(TAG, "MQTT manager deinitialized");
 }
 
 // Check connection status
@@ -457,6 +614,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "Connected to broker");
             mqtt_connected = true;
+            reconnect_attempt = 0;  // Reset reconnect counter on successful connection
+            
             esp_mqtt_client_publish(client, LWT_TOPIC, LWT_PAYLOAD_ONLINE, 0, 1, true);
             
             // Subscribe to command topics
@@ -469,8 +628,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             break;
             
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "Disconnected");
+            ESP_LOGW(TAG, "Disconnected from broker");
             mqtt_connected = false;
+            reconnect_attempt++;
+            
+            if (reconnect_attempt <= 3) {
+                // First 3 attempts - ESP-IDF MQTT client will automatically reconnect
+                ESP_LOGI(TAG, "Reconnecting to last known broker... (%d/3)", reconnect_attempt);
+                // Do nothing - library handles reconnection automatically
+            } else {
+                // After 3 failed reconnects - set flag for external task to handle
+                ESP_LOGI(TAG, "3 reconnect attempts failed, triggering broker rediscovery");
+                reconnect_attempt = 0;
+                rediscover_broker_flag = true;
+            }
             break;
             
         case MQTT_EVENT_DATA: {

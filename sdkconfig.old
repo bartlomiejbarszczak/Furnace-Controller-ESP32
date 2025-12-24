@@ -441,7 +441,7 @@ CONFIG_IDF_TARGET_ARCH="xtensa"
 # default:
 CONFIG_IDF_TARGET="esp32"
 # default:
-CONFIG_IDF_INIT_VERSION="6.1.0"
+CONFIG_IDF_INIT_VERSION="$IDF_INIT_VERSION"
 # default:
 CONFIG_IDF_TARGET_ESP32=y
 # default:
@@ -508,9 +508,9 @@ CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
 # Log
 #
 # default:
-CONFIG_BOOTLOADER_LOG_VERSION_1=y
+CONFIG_BOOTLOADER_LOG_VERSION_2=y
 # default:
-CONFIG_BOOTLOADER_LOG_VERSION=1
+CONFIG_BOOTLOADER_LOG_VERSION=2
 # default:
 # CONFIG_BOOTLOADER_LOG_LEVEL_NONE is not set
 # default:
@@ -532,7 +532,13 @@ CONFIG_BOOTLOADER_LOG_LEVEL=3
 # default:
 # CONFIG_BOOTLOADER_LOG_COLORS is not set
 # default:
+# CONFIG_BOOTLOADER_LOG_COLORS_SUPPORT is not set
+# default:
+# CONFIG_BOOTLOADER_LOG_TIMESTAMP_SOURCE_NONE is not set
+# default:
 CONFIG_BOOTLOADER_LOG_TIMESTAMP_SOURCE_CPU_TICKS=y
+# default:
+CONFIG_BOOTLOADER_LOG_TIMESTAMP_SUPPORT=y
 # end of Format
 
 #
@@ -542,6 +548,8 @@ CONFIG_BOOTLOADER_LOG_TIMESTAMP_SOURCE_CPU_TICKS=y
 CONFIG_BOOTLOADER_LOG_MODE_TEXT_EN=y
 # default:
 CONFIG_BOOTLOADER_LOG_MODE_TEXT=y
+# default:
+# CONFIG_BOOTLOADER_LOG_MODE_BINARY is not set
 # end of Settings
 # end of Log
 
@@ -808,16 +816,11 @@ CONFIG_COMPILER_CXX_GLIBCXX_CONSTEXPR_NO_CHANGE=y
 #
 
 #
-# !!! MINIMAL_BUILD is enabled !!!
+# Console Library
 #
-
-#
-# Only common components and those transitively required by the main component are listed
-#
-
-#
-# If a component configuration is missing, please add it to the main component's requirements
-#
+# default:
+# CONFIG_CONSOLE_SORTED_HELP is not set
+# end of Console Library
 
 #
 # Legacy Driver Configurations
@@ -1603,8 +1606,10 @@ CONFIG_FATFS_VOLUME_COUNT=2
 CONFIG_FATFS_LFN_HEAP=y
 # default:
 # CONFIG_FATFS_LFN_STACK is not set
-CONFIG_FATFS_SECTOR_512=y
-# CONFIG_FATFS_SECTOR_4096 is not set
+# default:
+# CONFIG_FATFS_SECTOR_512 is not set
+# default:
+CONFIG_FATFS_SECTOR_4096=y
 # default:
 # CONFIG_FATFS_CODEPAGE_DYNAMIC is not set
 # default:
@@ -1665,21 +1670,12 @@ CONFIG_FATFS_TIMEOUT_MS=10000
 CONFIG_FATFS_PER_FILE_CACHE=y
 # default:
 # CONFIG_FATFS_USE_FASTSEEK is not set
-# CONFIG_FATFS_USE_STRFUNC_NONE is not set
-CONFIG_FATFS_USE_STRFUNC_WITHOUT_CRLF_CONV=y
+# default:
+CONFIG_FATFS_USE_STRFUNC_NONE=y
+# default:
+# CONFIG_FATFS_USE_STRFUNC_WITHOUT_CRLF_CONV is not set
+# default:
 # CONFIG_FATFS_USE_STRFUNC_WITH_CRLF_CONV is not set
-# default:
-# CONFIG_FATFS_PRINT_LLI is not set
-# default:
-# CONFIG_FATFS_PRINT_FLOAT is not set
-# default:
-# CONFIG_FATFS_STRF_ENCODE_ANSI is not set
-# default:
-# CONFIG_FATFS_STRF_ENCODE_UTF16LE is not set
-# default:
-# CONFIG_FATFS_STRF_ENCODE_UTF16BE is not set
-# default:
-CONFIG_FATFS_STRF_ENCODE_UTF8=y
 # default:
 CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0
 # default:
@@ -1861,12 +1857,10 @@ CONFIG_HEAP_TRACING_OFF=y
 #
 # Log
 #
+# CONFIG_LOG_VERSION_1 is not set
+CONFIG_LOG_VERSION_2=y
 # default:
-CONFIG_LOG_VERSION_1=y
-# default:
-# CONFIG_LOG_VERSION_2 is not set
-# default:
-CONFIG_LOG_VERSION=1
+CONFIG_LOG_VERSION=2
 
 #
 # Log Level
@@ -1922,9 +1916,14 @@ CONFIG_LOG_TAG_LEVEL_IMPL_CACHE_SIZE=31
 # default:
 # CONFIG_LOG_COLORS is not set
 # default:
-CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
-# default:
+# CONFIG_LOG_COLORS_SUPPORT is not set
+# CONFIG_LOG_TIMESTAMP_SOURCE_NONE is not set
+# CONFIG_LOG_TIMESTAMP_SOURCE_RTOS is not set
 # CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM is not set
+CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM_FULL=y
+# CONFIG_LOG_TIMESTAMP_SOURCE_UNIX is not set
+# default:
+CONFIG_LOG_TIMESTAMP_SUPPORT=y
 # end of Format
 
 #
@@ -1934,6 +1933,8 @@ CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
 CONFIG_LOG_MODE_TEXT_EN=y
 # default:
 CONFIG_LOG_MODE_TEXT=y
+# default:
+# CONFIG_LOG_MODE_BINARY is not set
 # end of Settings
 
 # default:
@@ -2885,6 +2886,66 @@ CONFIG_WL_SECTOR_SIZE_4096=y
 # default:
 CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
+
+#
+# mDNS
+#
+# default:
+CONFIG_MDNS_MAX_INTERFACES=3
+# default:
+CONFIG_MDNS_MAX_SERVICES=10
+# default:
+CONFIG_MDNS_TASK_PRIORITY=1
+# default:
+CONFIG_MDNS_ACTION_QUEUE_LEN=16
+# default:
+CONFIG_MDNS_TASK_STACK_SIZE=4096
+# default:
+# CONFIG_MDNS_TASK_AFFINITY_NO_AFFINITY is not set
+# default:
+CONFIG_MDNS_TASK_AFFINITY_CPU0=y
+# default:
+# CONFIG_MDNS_TASK_AFFINITY_CPU1 is not set
+# default:
+CONFIG_MDNS_TASK_AFFINITY=0x0
+
+#
+# MDNS Memory Configuration
+#
+# default:
+CONFIG_MDNS_TASK_CREATE_FROM_INTERNAL=y
+# default:
+CONFIG_MDNS_MEMORY_ALLOC_INTERNAL=y
+# default:
+# CONFIG_MDNS_MEMORY_CUSTOM_IMPL is not set
+# end of MDNS Memory Configuration
+
+# default:
+CONFIG_MDNS_SERVICE_ADD_TIMEOUT_MS=2000
+# default:
+CONFIG_MDNS_TIMER_PERIOD_MS=100
+# default:
+# CONFIG_MDNS_NETWORKING_SOCKET is not set
+# default:
+# CONFIG_MDNS_SKIP_SUPPRESSING_OWN_QUERIES is not set
+# default:
+# CONFIG_MDNS_ENABLE_DEBUG_PRINTS is not set
+# default:
+CONFIG_MDNS_ENABLE_CONSOLE_CLI=y
+# default:
+# CONFIG_MDNS_RESPOND_REVERSE_QUERIES is not set
+# default:
+CONFIG_MDNS_MULTIPLE_INSTANCE=y
+
+#
+# MDNS Predefined interfaces
+#
+# default:
+CONFIG_MDNS_PREDEF_NETIF_STA=y
+# default:
+CONFIG_MDNS_PREDEF_NETIF_AP=y
+# end of MDNS Predefined interfaces
+# end of mDNS
 # end of Component config
 
 # default:
