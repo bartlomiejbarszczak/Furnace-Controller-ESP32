@@ -25,7 +25,7 @@ static const char *TAG = "FURNACE";
 
 // ============== GLOBALNE ==============
 static furnace_config_t config;
-static furnace_runtime_t runtime = {0};
+static furnace_runtime_t runtime = { 0 };
 static SemaphoreHandle_t furnace_mutex;
 static ds18b20_sensor_t temp_sensors[NUM_TEMP_SENSORS];
 static char wifi_ssid[32];
@@ -283,7 +283,7 @@ void update_pump_floor(void) {
         return;
     }
 
-    if (!config.pump_floor_enabled) {
+    if (!config.pump_floor_enabled && !runtime.runtime_underfloor_pump_enabled) {
         set_pump_floor(false);
         return;
     }
@@ -411,6 +411,11 @@ void fsm_update(void) {
             set_pump_main(false);
             set_pump_floor(false);
             set_pump_mixing_power(0);
+
+            // Wyłącz podłogówkę, jeśli była włączona manualnie
+            if (runtime.runtime_underfloor_pump_enabled) {
+                runtime.runtime_underfloor_pump_enabled = false;
+            }  
             
             // Przejścia
             // → Rozpalanie: temp rośnie LUB user kliknął LUB temp > temp_ignition
@@ -579,34 +584,46 @@ state_change:
 void sensor_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     float temperatures[NUM_TEMP_SENSORS];
+    int16_t print_temperatures[NUM_TEMP_SENSORS];
+    uint32_t print_count = 0;
     
     while (1) {
         int success = ds18b20_read_all(temp_sensors, NUM_TEMP_SENSORS, temperatures);
         
         if (success < NUM_TEMP_SENSORS) {
             ESP_LOGW(TAG, "Only %d/%d sensors read successfully", success, NUM_TEMP_SENSORS);
-            
-            ESP_LOGI(TAG, "Sensor temps: ");
-            for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-                ESP_LOGI(TAG, "Sensor %d: %.2f°C", i, temperatures[i]);
-            }
-
         }
 
         xSemaphoreTake(furnace_mutex, portMAX_DELAY);
         
-        // Odczyt wszystkich czujników DS18B20 (RAW)
-        runtime.temp_furnace_raw = (int16_t)temperatures[0];
-        runtime.temp_boiler_top_raw = (int16_t)temperatures[1];
-        runtime.temp_boiler_bottom_raw = (int16_t)temperatures[2];
-        runtime.temp_main_output_raw = (int16_t)temperatures[3];
-
-        //TODO: co w przypadku błędu odczytu?
+        // Odczyt wszystkich czujników DS18B20 (RAW), gdy niepoprawny odczyt - zachowaj poprzednią wartość
+        runtime.temp_furnace_raw = temp_sensors[0].is_valid ? (int16_t)temperatures[0] : runtime.temp_furnace_raw;
+        runtime.temp_boiler_top_raw = temp_sensors[1].is_valid ? (int16_t)temperatures[1] : runtime.temp_boiler_top_raw;
+        runtime.temp_boiler_bottom_raw = temp_sensors[2].is_valid ? (int16_t)temperatures[2] : runtime.temp_boiler_bottom_raw;
+        runtime.temp_main_output_raw = temp_sensors[3].is_valid ? (int16_t)temperatures[3] : runtime.temp_main_output_raw;
                 
         // Zastosowanie korekty temperatur
         apply_temp_corrections();
+
+        if (print_count % 60 == 0) {
+            print_temperatures[0] = runtime.temp_furnace;
+            print_temperatures[1] = runtime.temp_boiler_top;
+            print_temperatures[2] = runtime.temp_boiler_bottom;
+            print_temperatures[3] = runtime.temp_main_output;
+        }
             
         xSemaphoreGive(furnace_mutex);
+
+        // Wypisz temperatury co 1 minute
+        if (print_count % 60 == 0) {
+            ESP_LOGI(TAG, "Temperatures: Furnace=%d°C, Boiler Top=%d°C, Boiler Bottom=%d°C, Main Output=%d°C",
+                     print_temperatures[0],
+                     print_temperatures[1],
+                     print_temperatures[2],
+                     print_temperatures[3]);
+        }
+
+        print_count = (print_count + 1) % 60;
         
         // Co sekundę
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
@@ -616,6 +633,12 @@ void sensor_task(void *pvParameters) {
 // TASK 2: Aktualizacja histori temperatury pieca (średni priorytet)
 void temp_furnace_history_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    vTaskDelay(pdMS_TO_TICKS(2000)); // Poczekaj 2 sekundy na inicjalizację temperatury
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        runtime.temp_furnace_history[i] = runtime.temp_furnace;
+    }
+    runtime.temp_history_index = 0;
     
     while (1) {
         // Aktualizuj historię temperatury pieca co 1 minute
@@ -624,12 +647,6 @@ void temp_furnace_history_task(void *pvParameters) {
         runtime.temp_furnace_history[runtime.temp_history_index] = runtime.temp_furnace;
         runtime.temp_history_index = (runtime.temp_history_index + 1) % BUFFER_SIZE;
         
-        ESP_LOGI(TAG, "Temperatures: %d, %d, %d, %d, %d", 
-                runtime.temp_furnace_history[0],
-                runtime.temp_furnace_history[1],
-                runtime.temp_furnace_history[2],
-                runtime.temp_furnace_history[3],
-                runtime.temp_furnace_history[4]);
         xSemaphoreGive(furnace_mutex);
         
         
@@ -737,7 +754,7 @@ void watchdog_task(void *pvParameters) {
         xSemaphoreGive(furnace_mutex);
         
         uint32_t time_without_change = millis() - last_fsm_update;
-        const uint32_t max_time_in_state = 30 * 1000;
+        const uint32_t max_time_in_state = 60 * 1000;
 
         if (time_without_change > max_time_in_state) {
             ESP_LOGE(TAG, "WATCHDOG: FSM did not update within 60 seconds! Last state: %s. Restarting now!", state_to_string(current));
@@ -919,9 +936,16 @@ void app_main(void) {
     
     // Inicjalizacja czujników temperatury DS18B20
     temp_sensors[0].gpio_pin = config.pin_temp_sensor_furnace;
+    temp_sensors[0].name = "Furnace";
+
     temp_sensors[1].gpio_pin = config.pin_temp_sensor_boiler_top;
+    temp_sensors[1].name = "Boiler Top";
+
     temp_sensors[2].gpio_pin = config.pin_temp_sensor_boiler_bottom;
+    temp_sensors[2].name = "Boiler Bottom";
+
     temp_sensors[3].gpio_pin = config.pin_temp_sensor_main_output;
+    temp_sensors[3].name = "Main Output";
 
     err = ds18b20_init(temp_sensors, NUM_TEMP_SENSORS);
     if (err != ESP_OK) {

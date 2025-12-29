@@ -26,6 +26,7 @@
 // Sensor configuration structure
 typedef struct {
     gpio_num_t gpio_pin;
+    char *name;
     float last_temperature;
     bool is_valid;
 } ds18b20_sensor_t;

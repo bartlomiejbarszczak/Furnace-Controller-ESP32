@@ -110,6 +110,7 @@ typedef struct {
     // Flagi
     bool manual_shutdown_requested;
     bool manual_ignition_requested;
+    bool runtime_underfloor_pump_enabled;
     bool error_flag;
     
 } furnace_runtime_t;

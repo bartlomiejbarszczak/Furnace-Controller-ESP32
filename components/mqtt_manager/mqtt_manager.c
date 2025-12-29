@@ -310,7 +310,7 @@ int mqtt_manager_publish_status(char *topic, char *payload, size_t topic_size, s
                  pump_floor_on ? "ON" : "OFF",
                  pump_mixing_power,
                  blower_power,
-                 error_flag ? "ERROR" : "OK",
+                 error_flag ? "ERROR" : "NONE",
                  wifi_get_rssi(), 
                  esp_get_free_heap_size());
 
@@ -621,6 +621,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             // Subscribe to command topics
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/ignition", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/shutdown", 0);
+            esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/underfloor_pump", 0);
+            esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/clear-errors", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/restart", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/config", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/config/get", 0);
@@ -666,6 +668,39 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     xSemaphoreGive(data_mutex);
                     ESP_LOGI(TAG, "Manual shutdown requested via MQTT");
                     create_message_payload(status_payload, sizeof(status_payload), "shutdown", "ok", "");
+                    mqtt_manager_publish(MQTT_BASE_TOPIC "/command/status", status_payload, 1, false);
+                }
+            }
+            else if (strncmp(event->topic, MQTT_BASE_TOPIC "/command/pump/underfloor", event->topic_len) == 0) {
+                if (furnace_runtime && data_mutex) {
+                    if (strncmp(event->data, "ON", event->data_len) == 0) {
+                        xSemaphoreTake(data_mutex, portMAX_DELAY);
+                        furnace_runtime->runtime_underfloor_pump_enabled = true;
+                        xSemaphoreGive(data_mutex);
+                        ESP_LOGI(TAG, "Underfloor pump enabled via MQTT");
+                        create_message_payload(status_payload, sizeof(status_payload), "underfloor_pump", "ok", "Enabled");
+                        mqtt_manager_publish(MQTT_BASE_TOPIC "/command/status", status_payload, 1, false);
+                    } else if (strncmp(event->data, "OFF", event->data_len) == 0) {
+                        xSemaphoreTake(data_mutex, portMAX_DELAY);
+                        furnace_runtime->runtime_underfloor_pump_enabled = false;
+                        xSemaphoreGive(data_mutex);
+                        ESP_LOGI(TAG, "Underfloor pump disabled via MQTT");
+                        create_message_payload(status_payload, sizeof(status_payload), "underfloor_pump", "ok", "Disabled");
+                        mqtt_manager_publish(MQTT_BASE_TOPIC "/command/status", status_payload, 1, false);
+                    } else {
+                        ESP_LOGW(TAG, "Invalid underfloor pump argument: %.*s", event->data_len, event->data);
+                        create_message_payload(status_payload, sizeof(status_payload), "underfloor_pump", "error", "Invalid argument");
+                        mqtt_manager_publish(MQTT_BASE_TOPIC "/command/status", status_payload, 1, false);
+                    }
+                }
+            }
+            else if (strncmp(event->topic, MQTT_BASE_TOPIC "/command/clear_errors", event->topic_len) == 0) {
+                if (furnace_runtime && data_mutex) {
+                    xSemaphoreTake(data_mutex, portMAX_DELAY);
+                    furnace_runtime->error_flag = false;
+                    xSemaphoreGive(data_mutex);
+                    ESP_LOGI(TAG, "Error flags cleared via MQTT");
+                    create_message_payload(status_payload, sizeof(status_payload), "clear_errors", "ok", "");
                     mqtt_manager_publish(MQTT_BASE_TOPIC "/command/status", status_payload, 1, false);
                 }
             }

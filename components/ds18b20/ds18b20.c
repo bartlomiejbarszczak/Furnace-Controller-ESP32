@@ -9,20 +9,20 @@ static const char *TAG = "DS18B20";
 #define DS18B20_EXIT_CRITICAL() taskEXIT_CRITICAL(&mux)
 
 // Timing constants (microseconds) - based on DS18B20 datasheet
-#define TIMING_RESET_PULSE      480
-#define TIMING_PRESENCE_WAIT    70
-#define TIMING_PRESENCE_READ    410
-#define TIMING_WRITE_1_LOW      6
-#define TIMING_WRITE_1_HIGH     64
-#define TIMING_WRITE_0_LOW      60
-#define TIMING_WRITE_0_HIGH     10
-#define TIMING_READ_INIT        6
-#define TIMING_READ_WAIT        9
-#define TIMING_READ_RELEASE     55
-#define TIMING_SLOT_RECOVERY    1
+#define TIMING_RESET_PULSE      500     // 480
+#define TIMING_PRESENCE_WAIT    80      // 70
+#define TIMING_PRESENCE_READ    420     // 410
+#define TIMING_WRITE_1_LOW      8       // 6
+#define TIMING_WRITE_1_HIGH     70      // 64
+#define TIMING_WRITE_0_LOW      65      // 60
+#define TIMING_WRITE_0_HIGH     10      
+#define TIMING_READ_INIT        8       // 6
+#define TIMING_READ_WAIT        12      // 9
+#define TIMING_READ_RELEASE     60      // 55
+#define TIMING_SLOT_RECOVERY    2       // 1
 
-// Conversion time (milliseconds)
-#define DS18B20_CONVERSION_TIME_MS  250 // 625 --- Max time for 12-bit resolution
+#define DS18B20_CONVERSION_TIME_MS  750 // Conversion time (milliseconds)
+#define MAX_READ_RETRIES 3
 
 // Static helper functions
 static void ds18b20_set_output(gpio_num_t pin);
@@ -198,9 +198,9 @@ esp_err_t ds18b20_init(ds18b20_sensor_t *sensors, uint8_t num_sensors) {
         
         // Test presence
         if (ds18b20_reset(sensors[i].gpio_pin) != DS18B20_OK) {
-            ESP_LOGW(TAG, "Sensor on GPIO %d not detected", sensors[i].gpio_pin);
+            ESP_LOGW(TAG, "Sensor on GPIO %d -%s- not detected", sensors[i].gpio_pin, sensors[i].name);
         } else {
-            ESP_LOGI(TAG, "Sensor on GPIO %d initialized", sensors[i].gpio_pin);
+            ESP_LOGI(TAG, "Sensor on GPIO %d -%s- initialized", sensors[i].gpio_pin, sensors[i].name);
         }
     }
     
@@ -241,6 +241,7 @@ int ds18b20_trigger_all_conversions(ds18b20_sensor_t *sensors, uint8_t num_senso
 int ds18b20_read_temperature(ds18b20_sensor_t *sensor, float *temperature) {
     uint8_t scratchpad[9];
     int16_t raw_temp;
+    int retry_count = 0;
     
     if (sensor == NULL || temperature == NULL) {
         return DS18B20_ERROR_NO_DEVICE;
@@ -249,26 +250,40 @@ int ds18b20_read_temperature(ds18b20_sensor_t *sensor, float *temperature) {
     // Wait for conversion to complete
     vTaskDelay(pdMS_TO_TICKS(DS18B20_CONVERSION_TIME_MS));
     
-    // Reset and check presence
-    if (ds18b20_reset(sensor->gpio_pin) != DS18B20_OK) {
-        sensor->is_valid = false;
-        return DS18B20_ERROR_NO_DEVICE;
-    }
-    
-    // Skip ROM and read scratchpad
-    ds18b20_write_byte(sensor->gpio_pin, DS18B20_SKIP_ROM);
-    ds18b20_write_byte(sensor->gpio_pin, DS18B20_READ_SCRATCHPAD);
-    
-    // Read 9 bytes of scratchpad
-    for (uint8_t i = 0; i < 9; i++) {
-        scratchpad[i] = ds18b20_read_byte(sensor->gpio_pin);
-    }
-    
-    // Verify CRC
-    if (ds18b20_crc8(scratchpad, 8) != scratchpad[8]) {
-        ESP_LOGW(TAG, "CRC error on GPIO %d", sensor->gpio_pin);
-        sensor->is_valid = false;
-        return DS18B20_ERROR_CRC;
+    // Retry logic for CRC errors
+    while (retry_count < MAX_READ_RETRIES) {
+        // Reset and check presence
+        if (ds18b20_reset(sensor->gpio_pin) != DS18B20_OK) {
+            sensor->is_valid = false;
+            return DS18B20_ERROR_NO_DEVICE;
+        }
+        
+        // Skip ROM and read scratchpad
+        ds18b20_write_byte(sensor->gpio_pin, DS18B20_SKIP_ROM);
+        ds18b20_write_byte(sensor->gpio_pin, DS18B20_READ_SCRATCHPAD);
+        
+        // Read 9 bytes of scratchpad
+        for (uint8_t i = 0; i < 9; i++) {
+            scratchpad[i] = ds18b20_read_byte(sensor->gpio_pin);
+        }
+        
+        // Verify CRC
+        if (ds18b20_crc8(scratchpad, 8) == scratchpad[8]) {
+            // CRC OK - break out of retry loop
+            break;
+        }
+        
+        retry_count++;
+        if (retry_count < MAX_READ_RETRIES) {
+            ESP_LOGW(TAG, "CRC error on GPIO %d -%s-, retry %d/%d", 
+                    sensor->gpio_pin, sensor->name, retry_count, MAX_READ_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(10)); // Small delay before retry
+        } else {
+            ESP_LOGE(TAG, "CRC error on GPIO %d -%s- after %d retries", 
+                    sensor->gpio_pin, sensor->name, MAX_READ_RETRIES);
+            sensor->is_valid = false;
+            return DS18B20_ERROR_CRC;
+        }
     }
     
     // Calculate temperature
@@ -277,7 +292,7 @@ int ds18b20_read_temperature(ds18b20_sensor_t *sensor, float *temperature) {
     
     // Check for power-on reset value (85°C)
     if (*temperature == 85.0f) {
-        ESP_LOGW(TAG, "Invalid reading (85°C) on GPIO %d", sensor->gpio_pin);
+        ESP_LOGW(TAG, "Invalid reading (85°C) on GPIO %d -%s-", sensor->gpio_pin, sensor->name);
         sensor->is_valid = false;
         return DS18B20_ERROR_TIMEOUT;
     }
@@ -302,49 +317,64 @@ int ds18b20_read_all(ds18b20_sensor_t *sensors, uint8_t num_sensors, float *temp
     // Wait for conversions to complete
     vTaskDelay(pdMS_TO_TICKS(DS18B20_CONVERSION_TIME_MS));
     
-    // Read all sensors
+    // Read all sensors with retry logic
     for (uint8_t i = 0; i < num_sensors; i++) {
-        // Reset and check presence
-        if (ds18b20_reset(sensors[i].gpio_pin) != DS18B20_OK) {
-            temperatures[i] = 500.0f;  // Error value
-            sensors[i].is_valid = false;
-            continue;
+        int retry_count = 0;
+        bool read_success = false;
+        
+        while (retry_count < MAX_READ_RETRIES && !read_success) {
+            // Reset and check presence
+            if (ds18b20_reset(sensors[i].gpio_pin) != DS18B20_OK) {
+                temperatures[i] = 500.0f;  // Error value
+                sensors[i].is_valid = false;
+                break;
+            }
+            
+            // Skip ROM and read scratchpad
+            ds18b20_write_byte(sensors[i].gpio_pin, DS18B20_SKIP_ROM);
+            ds18b20_write_byte(sensors[i].gpio_pin, DS18B20_READ_SCRATCHPAD);
+            
+            // Read scratchpad
+            uint8_t scratchpad[9];
+            for (uint8_t j = 0; j < 9; j++) {
+                scratchpad[j] = ds18b20_read_byte(sensors[i].gpio_pin);
+            }
+            
+            // Verify CRC
+            if (ds18b20_crc8(scratchpad, 8) != scratchpad[8]) {
+                retry_count++;
+                if (retry_count < MAX_READ_RETRIES) {
+                    ESP_LOGW(TAG, "CRC error on GPIO %d -%s-, retry %d/%d", 
+                            sensors[i].gpio_pin, sensors[i].name, retry_count, MAX_READ_RETRIES);
+                    vTaskDelay(pdMS_TO_TICKS(10)); // Small delay before retry
+                    continue;
+                } else {
+                    ESP_LOGE(TAG, "CRC error on GPIO %d -%s- after %d retries", 
+                            sensors[i].gpio_pin, sensors[i].name, MAX_READ_RETRIES);
+                    temperatures[i] = 500.0f;  // Error value
+                    sensors[i].is_valid = false;
+                    break;
+                }
+            }
+            
+            // Calculate temperature
+            int16_t raw_temp = (scratchpad[1] << 8) | scratchpad[0];
+            temperatures[i] = (float)raw_temp / 16.0f;
+            
+            // Check for power-on reset value
+            if (temperatures[i] == 85.0f) {
+                ESP_LOGW(TAG, "Invalid reading (85°C) on GPIO %d -%s-", sensors[i].gpio_pin, sensors[i].name);
+                temperatures[i] = 500.0f;  // Error value
+                sensors[i].is_valid = false;
+                break;
+            }
+            
+            // Success!
+            sensors[i].last_temperature = temperatures[i];
+            sensors[i].is_valid = true;
+            success_count++;
+            read_success = true;
         }
-        
-        // Skip ROM and read scratchpad
-        ds18b20_write_byte(sensors[i].gpio_pin, DS18B20_SKIP_ROM);
-        ds18b20_write_byte(sensors[i].gpio_pin, DS18B20_READ_SCRATCHPAD);
-        
-        // Read scratchpad
-        uint8_t scratchpad[9];
-        for (uint8_t j = 0; j < 9; j++) {
-            scratchpad[j] = ds18b20_read_byte(sensors[i].gpio_pin);
-        }
-        
-        // Verify CRC
-        if (ds18b20_crc8(scratchpad, 8) != scratchpad[8]) {
-            ESP_LOGW(TAG, "CRC error on GPIO %d", sensors[i].gpio_pin);
-            temperatures[i] = 500.0f;  // Error value
-            sensors[i].is_valid = false;
-            continue;
-        }
-        
-        // Calculate temperature
-        int16_t raw_temp = (scratchpad[1] << 8) | scratchpad[0];
-        temperatures[i] = (float)raw_temp / 16.0f;
-        
-        // Check for power-on reset value
-        if (temperatures[i] == 85.0f) {
-            ESP_LOGW(TAG, "Invalid reading (85°C) on GPIO %d", sensors[i].gpio_pin);
-            temperatures[i] = 500.0f;  // Error value
-            sensors[i].is_valid = false;
-            continue;
-        }
-        
-        // Update sensor state
-        sensors[i].last_temperature = temperatures[i];
-        sensors[i].is_valid = true;
-        success_count++;
     }
     
     return success_count;
