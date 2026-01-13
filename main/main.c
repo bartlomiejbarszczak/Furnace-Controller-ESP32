@@ -16,22 +16,22 @@
 #include "ds18b20.h"
 #include "wifi_manager.h"
 
-// ============== DEFINICJE ==============
-#define TEMP_OVERHEAT 95        // Próg temperatury przegrzania
-#define TEMP_FREEZE_THRESHOLD 4 // Próg temperatury do alertu ochłodzenia
-#define NUM_TEMP_SENSORS 4      // Liczba czujników DS18B20
+// ============== DEFINES ==============
+#define TEMP_OVERHEAT 95        // Overheat temperature threshold [°C]
+#define TEMP_FREEZE_THRESHOLD 4 // Temperature freeze alert threshold [°C]
+#define NUM_TEMP_SENSORS 4      // Number of DS18B20 temperature sensors
     
 static const char *TAG = "FURNACE";
 
-// ============== GLOBALNE ==============
-static furnace_config_t config;
-static furnace_runtime_t runtime = { 0 };
-static SemaphoreHandle_t furnace_mutex;
-static ds18b20_sensor_t temp_sensors[NUM_TEMP_SENSORS];
-static char wifi_ssid[32];
-static char wifi_password[64];
+// ============== GLOBAL VARIABLES ==============
+static furnace_config_t config;              /**< Furnace configuration structure */
+static furnace_runtime_t runtime = { 0 };    /**< Runtime state and telemetry */
+static SemaphoreHandle_t furnace_mutex;      /**< Mutex for thread-safe access to runtime */
+static ds18b20_sensor_t temp_sensors[NUM_TEMP_SENSORS]; /**< Temperature sensor array */
+static char wifi_ssid[32];                   /**< WiFi SSID buffer */
+static char wifi_password[64];               /**< WiFi password buffer */
 
-// ============== PROTOTYPY ==============
+// ============== FUNCTION PROTOTYPES ==============
 void set_pump_main(bool state);
 void set_pump_floor(bool state);
 void set_pump_mixing_power(uint8_t power);
@@ -51,7 +51,13 @@ bool save_wifi_config_to_sd(const char *ssid, const size_t ssid_len, const char 
 bool load_wifi_config_from_sd(char *ssid, size_t ssid_size, char *password, size_t password_size);
 void initialize_time(void);
 
-// Wrapper dla config_save_to_nvs (do przekazania callbacku)
+/**
+ * @brief Wrapper for saving configuration to both NVS and SD card
+ * 
+ * Used as callback to save configuration to multiple storage locations.
+ * 
+ * @return true if both NVS and SD saves succeed, false otherwise
+ */
 bool config_save_wrapper(void) {
     bool result_nvs = config_save_to_nvs(&config);
     bool result_sd = save_config_to_sd(&config);
@@ -60,9 +66,14 @@ bool config_save_wrapper(void) {
 }
 
 
-// ============== FUNKCJE POMOCNICZE ==============
+// ============== HELPER FUNCTIONS ==============
 
-// Zastosuj korekty temperatur
+/**
+ * @brief Apply temperature corrections to raw sensor readings
+ * 
+ * Applies configured correction offsets to raw temperature values from sensors.
+ * This compensates for sensor calibration errors.
+ */
 void apply_temp_corrections(void) {
     runtime.temp_furnace = runtime.temp_furnace_raw + config.temp_correction_furnace;
     runtime.temp_boiler_top = runtime.temp_boiler_top_raw + config.temp_correction_boiler_top;
@@ -70,7 +81,15 @@ void apply_temp_corrections(void) {
     runtime.temp_main_output = runtime.temp_main_output_raw;
 }
 
-// Sprawdź czy temperatura pieca rośnie (analiza różnicy max-min w buforze)
+/**
+ * @brief Detect if furnace temperature is rising
+ * 
+ * Analyzes the temperature history buffer to determine if furnace temperature
+ * is rising. If the difference between max and min in the buffer exceeds 4°C,
+ * temperature is considered rising.
+ * 
+ * @return true if temperature is rising, false otherwise
+ */
 bool is_temp_rising(void) {
     int16_t min_temp = runtime.temp_furnace_history[0];
     int16_t max_temp = runtime.temp_furnace_history[0];
@@ -81,7 +100,7 @@ bool is_temp_rising(void) {
         if (temp > max_temp) max_temp = temp;
     }
 
-    // Jeśli różnica między max a min jest większa niż 4°C, uznajemy że temp rośnie
+    // If difference between max and min exceeds 4°C, consider temperature rising
     if ((max_temp - min_temp) >= 4) {
         ESP_LOGI(TAG, "Temperature rising detected (max: %d, min: %d)", max_temp, min_temp);
         return true;
@@ -90,7 +109,19 @@ bool is_temp_rising(void) {
     }
 }
 
-// Interpolacja liniowa
+/**
+ * @brief Perform linear interpolation between two points
+ * 
+ * Maps a value from one range to another using linear interpolation.
+ * Clamps results to ensure output stays within specified bounds.
+ * 
+ * @param value The input value to interpolate
+ * @param min_val Minimum input value
+ * @param max_val Maximum input value
+ * @param min_power Minimum output power
+ * @param max_power Maximum output power
+ * @return Interpolated power value (0-100)
+ */
 uint8_t interpolate_linear(int16_t value, int16_t min_val, int16_t max_val, uint8_t min_power, uint8_t max_power) {
     if (value <= min_val) return min_power;
     if (value >= max_val) return max_power;
@@ -103,14 +134,28 @@ uint8_t interpolate_linear(int16_t value, int16_t min_val, int16_t max_val, uint
     return (uint8_t)power;
 }
 
+/**
+ * @brief Get elapsed time in milliseconds since FreeRTOS start
+ * 
+ * @return Current tick count converted to milliseconds
+ */
 uint32_t millis(void) {
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
+/**
+ * @brief Save furnace configuration to SD card
+ * 
+ * Persists the current furnace configuration to the SD card.
+ * Returns success if card is not available (assumes user doesn't have SD).
+ * 
+ * @param config Pointer to configuration structure to save
+ * @return true if saved or SD not available, false if save failed
+ */
 bool save_config_to_sd(const furnace_config_t *config) {
     sd_logger_status_t sd_status = sd_logger_get_status();
 
-    // If card is not mounted, return true to avoid false error due to no SD
+    // If card is not mounted, return true (user may not have SD card)
     if (sd_status == SD_STATUS_NO_CARD) {
         ESP_LOGW(TAG, "Cannot save config to SD card - SD card not mounted");
         return true;
@@ -131,6 +176,15 @@ bool save_config_to_sd(const furnace_config_t *config) {
     }
 }
 
+/**
+ * @brief Load furnace configuration from SD card
+ * 
+ * Attempts to load configuration from SD card.
+ * Returns false if SD card is not ready.
+ * 
+ * @param config Pointer to configuration structure to load into
+ * @return true if successfully loaded, false otherwise
+ */
 bool load_config_from_sd(furnace_config_t *config) {
     if (!sd_logger_is_ready()) {
         ESP_LOGW(TAG, "Cannot load config form SD card - SD card not ready");
@@ -150,6 +204,17 @@ bool load_config_from_sd(furnace_config_t *config) {
 }
 
 
+/**
+ * @brief Save WiFi credentials to SD card
+ * 
+ * Persists WiFi SSID and password to SD card for persistent storage.
+ * 
+ * @param ssid WiFi SSID string
+ * @param ssid_len Length of SSID
+ * @param password WiFi password string
+ * @param password_len Length of password
+ * @return true if saved, false if save failed
+ */
 bool save_wifi_config_to_sd(const char *ssid, const size_t ssid_len, const char *password, const size_t password_len) {
     sd_logger_status_t sd_status = sd_logger_get_status();
 
@@ -175,6 +240,17 @@ bool save_wifi_config_to_sd(const char *ssid, const size_t ssid_len, const char 
 }
 
 
+/**
+ * @brief Load WiFi credentials from SD card
+ * 
+ * Attempts to load WiFi SSID and password from SD card.
+ * 
+ * @param ssid Buffer to load SSID into
+ * @param ssid_size Size of SSID buffer
+ * @param password Buffer to load password into
+ * @param password_size Size of password buffer
+ * @return true if successfully loaded, false otherwise
+ */
 bool load_wifi_config_from_sd(char *ssid, size_t ssid_size, char *password, size_t password_size) {
     if (!sd_logger_is_ready()) {
         ESP_LOGW(TAG, "Cannot load WiFi config from SD card - SD card not ready");
@@ -194,6 +270,14 @@ bool load_wifi_config_from_sd(char *ssid, size_t ssid_size, char *password, size
 }
 
 
+/**
+ * @brief Callback when SD card is inserted or removed
+ * 
+ * Handles initialization and cleanup of SD card logging when card presence changes.
+ * Saves current configuration when card is inserted.
+ * 
+ * @param card_present true if card was inserted, false if removed
+ */
 void on_card_event(bool card_present) {
     if (card_present) {
         sd_logger_set_vprintf_handler(true);
@@ -219,6 +303,13 @@ void on_card_event(bool card_present) {
     }
 }
 
+/**
+ * @brief Initialize system time via SNTP
+ * 
+ * Sets up SNTP client to synchronize system time with NTP servers.
+ * Configures timezone for Warsaw (CET/CEST).
+ * Blocks until time synchronization succeeds.
+ */
 void initialize_time(void) {
     ESP_LOGI(TAG, "Initializing SNTP for Warsaw...");
 
@@ -240,24 +331,31 @@ void initialize_time(void) {
     ESP_LOGI(TAG, "Time synchronization finished.");
 }
 
-// ============== LOGIKA POMP ==============
+// ============== PUMP CONTROL LOGIC ==============
 
-// Logika pompy głównej obiegowej
+/**
+ * @brief Update main circulation pump state based on temperature
+ * 
+ * Implements hysteresis-based control logic:
+ * - In overheat/cooling states: pump ON
+ * - In work/blowthrough states: ON/OFF based on furnace temperature
+ * - In other states: pump OFF
+ */
 void update_pump_main(void) {
     if (runtime.current_state == STATE_OVERHEAT) {
-        // Przegrzanie - wszystkie pompy ON
+        // Overheat condition - enable all pumps
         set_pump_main(true);
         return;
     }
     
     if (runtime.current_state == STATE_COOLING) {
-        // Ochłodzenie - główna pompa ON
+        // Cooling condition - enable main pump
         set_pump_main(true);
         return;
     }
     
     if (runtime.current_state == STATE_WORK || runtime.current_state == STATE_BLOWTHROUGH) {
-        // Sterowanie z histerezą
+        // Temperature-based control with hysteresis
         int16_t half_hysteresis = config.temp_activ_pump_main_hysteresis / 2;
         int16_t temp_on = config.temp_activ_pump_main + half_hysteresis;
         int16_t temp_off = config.temp_activ_pump_main - half_hysteresis;
@@ -267,18 +365,23 @@ void update_pump_main(void) {
         } else if (runtime.temp_furnace < temp_off) {
             set_pump_main(false);
         }
-        // Pomiędzy - zachowaj poprzedni stan
+        // Between thresholds - maintain current state
         return;
     }
     
-    // W pozostałych stanach - wyłącz
+    // In other states - disable pump
     set_pump_main(false);
 }
 
-// Logika pompy podłogówki
+/**
+ * @brief Update floor heating pump state
+ * 
+ * Floor pump only operates when main pump is running in work/blowthrough states.
+ * Can be manually overridden at runtime.
+ */
 void update_pump_floor(void) {
     if (runtime.current_state == STATE_OVERHEAT) {
-        // Przegrzanie - wszystkie pompy ON
+        // Overheat condition - enable all pumps
         set_pump_floor(true);
         return;
     }
@@ -288,7 +391,7 @@ void update_pump_floor(void) {
         return;
     }
     
-    // Podłogówka działa gdy główna pompa działa
+    // Floor pump only operates when main pump is running
     if (runtime.current_state == STATE_WORK || runtime.current_state == STATE_BLOWTHROUGH) {
         set_pump_floor(runtime.pump_main_on);
         return;
@@ -297,34 +400,40 @@ void update_pump_floor(void) {
     set_pump_floor(false);
 }
 
-// Logika pompy mieszającej
+/**
+ * @brief Update mixing pump power based on boiler temperature differential
+ * 
+ * Controls pump power through linear interpolation of boiler vertical temperature
+ * difference. Active in shutdown, work, and blowthrough states.
+ * Respects boiler top priority setting if enabled.
+ */
 void update_pump_mixing(void) {
     if (runtime.current_state == STATE_OVERHEAT) {
-        // Przegrzanie - wszystkie pompy ON na max
+        // Overheat condition - enable all pumps at maximum power
         set_pump_mixing_power(config.pump_mixing_power_max);
         return;
     }
     
-    // Lista stanów, w których działa pompa mieszająca
+    // Active in shutdown, work, and blowthrough states
     if (runtime.current_state == STATE_SHUTDOWN ||
         runtime.current_state == STATE_WORK ||
         runtime.current_state == STATE_BLOWTHROUGH) {
 
-        // Oblicz różnicę temperatur góra-dół
+        // Calculate boiler vertical temperature difference (top - bottom)
         int16_t diff_top_bottom = runtime.temp_boiler_top - runtime.temp_boiler_bottom;
         
-        // Warunki do mieszania
+        // Mixing conditions
         bool cond1 = runtime.temp_furnace > runtime.temp_boiler_top + config.temp_diff_furnace_boiler;
         bool cond2 = diff_top_bottom > config.temp_diff_boiler_vertical;
         
-        // Sprawdź priorytet góry bojlera
+        // Check boiler top priority setting
         bool priority_ok = true;
         if (config.boiler_top_priority_enabled) {
             priority_ok = runtime.temp_boiler_top > config.temp_boiler_top_priority;
         }
         
         if (cond1 && cond2 && priority_ok) {
-            // Moc zależna od różnicy góra-dół
+            // Power depends on boiler vertical temperature difference
             uint8_t power = interpolate_linear(
                 diff_top_bottom,
                 config.temp_diff_boiler_vertical,
@@ -339,11 +448,18 @@ void update_pump_mixing(void) {
         return;
     }
     
-    // W pozostałych stanach - wyłącz
+    // In other states - disable pump
     set_pump_mixing_power(0);
 }
 
-// Logika dmuchawy
+/**
+ * @brief Update blower fan power
+ * 
+ * Controls blower power based on furnace state:
+ * - Ignition: maximum power
+ * - Blowthrough: interpolated power (high to low over duration)
+ * - Other states: off
+ */
 void update_blower(void) {
     if (!config.blower_enabled) {
         set_blower_power(0);
@@ -351,27 +467,27 @@ void update_blower(void) {
     }
     
     if (runtime.current_state == STATE_IGNITION) {
-        // Rozpalanie - max moc
+        // Ignition phase - maximum power
         set_blower_power(config.blower_power_max);
         return;
     }
     
     if (runtime.current_state == STATE_BLOWTHROUGH) {
-        // Przedmuch - moc zależna od czasu (interpolacja od połowy max do min)
+        // Blowthrough phase - power tapers from high to low over time
         uint32_t time_in_state = millis() - runtime.state_entry_time;
         uint32_t total_time = config.time_blowthrough_sec * 1000;
         uint32_t remaining_time = total_time - time_in_state;
         
         if (remaining_time > total_time) remaining_time = total_time;
         
-        // Na początku: połowa max (ale nie mniej niż min)
-        // Na końcu: min moc
+        // Start power: half of max (but at least min)
+        // End power: min power
         uint8_t start_power = config.blower_power_max / 2;
         if (start_power < config.blower_power_min) {
             start_power = config.blower_power_min;
         }
         
-        // Interpolacja liniowa w czasie
+        // Linear interpolation over time
         uint8_t power = interpolate_linear(
             remaining_time,
             0,
@@ -384,11 +500,30 @@ void update_blower(void) {
         return;
     }
     
-    // W pozostałych stanach - wyłącz
+    // In other states - disable blower
     set_blower_power(0);
 }
 
-// ============== MASZYNA STANÓW ==============
+// ============== FINITE STATE MACHINE ==============
+
+/**
+ * @brief Update furnace finite state machine
+ * 
+ * Implements the main control logic FSM. Processes state transitions based on:
+ * - Temperature thresholds
+ * - Manual user requests
+ * - Time-based conditions
+ * - Safety conditions (overheat detection)
+ * 
+ * States:
+ * - IDLE: Furnace not working, just monitoring
+ * - IGNITION: Starting furnace, reaching work temperature
+ * - WORK: Normal operation with pumps and fans
+ * - BLOWTHROUGH: Periodic ventilation cycle
+ * - SHUTDOWN: Cooling down the furnace
+ * - OVERHEAT: Safety state when temperature is too high
+ * - COOLING: Emergency cooling when temperature is too low
+ */
 void fsm_update(void) {
     uint32_t time_in_state = millis() - runtime.state_entry_time;
     uint32_t time_since_last_blowthrough = millis() - runtime.last_blowthrough_time;
@@ -396,7 +531,7 @@ void fsm_update(void) {
 
     runtime.last_fsm_update_time = millis();
     
-    // Globalny warunek przegrzania
+    // Global overheat safety check - high priority
     if (runtime.temp_furnace >= TEMP_OVERHEAT && runtime.current_state != STATE_OVERHEAT) {
         runtime.state_before_overheat = runtime.current_state;
         next_state = STATE_OVERHEAT;
@@ -406,26 +541,26 @@ void fsm_update(void) {
     switch (runtime.current_state) {
         
         case STATE_IDLE:
-            // Wszystko wyłączone
+            // All actuators off
             set_blower_power(0);
             set_pump_main(false);
             set_pump_floor(false);
             set_pump_mixing_power(0);
 
-            // Wyłącz podłogówkę, jeśli była włączona manualnie
+            // Disable floor pump if it was manually enabled
             if (runtime.runtime_underfloor_pump_enabled) {
                 runtime.runtime_underfloor_pump_enabled = false;
             }  
             
-            // Przejścia
-            // → Rozpalanie: temp rośnie LUB user kliknął LUB temp > temp_ignition
+            // Transitions:
+            // → IGNITION: temperature rising OR manual request OR temp > ignition threshold
             if (is_temp_rising() || 
                 runtime.manual_ignition_requested || 
                 runtime.temp_furnace > config.temp_ignition) {
                 next_state = STATE_IGNITION;
                 runtime.manual_ignition_requested = false;
             }
-            // → Ochłodzenie: temp < 4°C (ale nie częściej niż co 30 min)
+            // → COOLING: temp < 4°C (but not more than once per 30 minutes)
             else if (runtime.temp_furnace < TEMP_FREEZE_THRESHOLD) {
                 uint32_t time_since_last_alert = millis() - runtime.last_cooling_alert_time;
                 if (time_since_last_alert > (30 * 60 * 1000)) {
@@ -436,25 +571,26 @@ void fsm_update(void) {
             break;
             
         case STATE_IGNITION:
-            update_blower();  // Max moc jeśli enabled
+            // Ignition phase - full power if blower enabled
+            update_blower();
             set_pump_main(false);
             set_pump_floor(false);
             set_pump_mixing_power(0);
             
-            // Przejścia
-            // → Spoczynek: timeout 15 minut
+            // Transitions:
+            // → IDLE: timeout 15 minutes
             if (time_in_state > (15 * 60 * 1000)) {
                 next_state = STATE_IDLE;
                 runtime.error_flag = true;
                 ESP_LOGE(TAG, "Ignition timeout!");
             }
-            // → Praca: osiągnięto docelową temperaturę
+            // → WORK: target work temperature reached
             else if (runtime.temp_furnace >= config.temp_target_work) {
                 next_state = STATE_WORK;
                 runtime.last_blowthrough_time = millis();
             }
 
-            // → Wygaszanie: żadanie manualne
+            // → SHUTDOWN: manual shutdown request
             else if (runtime.manual_shutdown_requested) {
                 next_state = STATE_SHUTDOWN;
                 runtime.manual_shutdown_requested = false;
@@ -462,23 +598,23 @@ void fsm_update(void) {
             break;
             
         case STATE_WORK:
-            // Dmuchawa wyłączona w pracy
+            // Blower off during normal work
             set_blower_power(0);
             
-            // Pompy sterowane
+            // Pumps controlled based on temperature
             update_pump_main();
             update_pump_floor();
             update_pump_mixing();
             
-            // Przejścia
-            // → Przedmuch: cykliczne (tylko jeśli dmuchawa enabled i interval > 0)
+            // Transitions:
+            // → BLOWTHROUGH: periodic cycle (only if blower enabled and interval > 0)
             if (config.blower_enabled && config.time_blowthrough_interval_min > 0) {
                 uint32_t interval_ms = config.time_blowthrough_interval_min * 60 * 1000;
                 if (time_since_last_blowthrough > interval_ms) {
                     next_state = STATE_BLOWTHROUGH;
                 }
             }
-            // → Wygaszanie: temp < (temp_shutdown - 1) LUB manual shutdown
+            // → SHUTDOWN: temp < (shutdown threshold - 1) OR manual shutdown
             if (runtime.temp_furnace < (config.temp_shutdown - 1) || 
                 runtime.manual_shutdown_requested) {
                 next_state = STATE_SHUTDOWN;
@@ -487,15 +623,16 @@ void fsm_update(void) {
             break;
             
         case STATE_BLOWTHROUGH:
-            update_blower();  // Interpolowana moc
+            // Blower with interpolated power
+            update_blower();
             
-            // Pompy działają jak w pracy
+            // Pumps operate same as in work state
             update_pump_main();
             update_pump_floor();
             update_pump_mixing();
             
-            // Przejścia
-            // → Praca: czas przedmuchu minął
+            // Transitions:
+            // → WORK: blowthrough duration expired
             if (time_in_state > (config.time_blowthrough_sec * 1000)) {
                 next_state = STATE_WORK;
                 runtime.last_blowthrough_time = millis();
@@ -503,7 +640,7 @@ void fsm_update(void) {
             break;
             
         case STATE_SHUTDOWN:
-            // Tylko pompa może działać (jeśli włączona)
+            // Only mixing pump can operate if enabled
             set_blower_power(0);
             set_pump_main(false);
             set_pump_floor(false);
@@ -514,12 +651,12 @@ void fsm_update(void) {
                 set_pump_mixing_power(0);
             }
               
-            // Przejścia
-            // → Spoczynek: temp < (temp_ignition - 1)
+            // Transitions:
+            // → IDLE: temp < (ignition threshold - 1)
             if (runtime.temp_furnace < (config.temp_ignition - 1)) {
                 next_state = STATE_IDLE;
             }
-            // → Rozpalanie: temp rośnie
+            // → IGNITION: temperature rising OR manual request
             else if (is_temp_rising() || runtime.manual_ignition_requested) {
                 next_state = STATE_IGNITION;
                 runtime.manual_ignition_requested = false;
@@ -527,14 +664,14 @@ void fsm_update(void) {
             break;
             
         case STATE_OVERHEAT:
-            // Wszystkie pompy ON, dmuchawa OFF
+            // Overheat state - enable all pumps, disable blower
             set_blower_power(0);
             set_pump_main(true);
             set_pump_floor(true);
             set_pump_mixing_power(config.pump_mixing_power_max);
             
-            // Przejścia
-            // → Do poprzedniego stanu: temp < bezpieczna
+            // Transition:
+            // → PREVIOUS STATE: temp < safe temperature
             if (runtime.temp_furnace < config.temp_safe_after_overheat) {
                 next_state = runtime.state_before_overheat;
                 ESP_LOGI(TAG, "Overheat cleared, returning to %s", 
@@ -543,14 +680,14 @@ void fsm_update(void) {
             break;
             
         case STATE_COOLING:
-            // Główna pompa ON, reszta OFF
+            // Cooling state - main pump only, enable cooling circulation
             set_blower_power(0);
             set_pump_main(true);
             set_pump_floor(false);
             set_pump_mixing_power(0);
             
-            // Przejścia
-            // → Spoczynek: minęło 10 minut LUB temp > 5°C
+            // Transitions:
+            // → IDLE: timeout 10 minutes OR temp > 5°C
             if (time_in_state > (10 * 60 * 1000) || 
                 runtime.temp_furnace > 5) {
                 next_state = STATE_IDLE;
@@ -558,14 +695,14 @@ void fsm_update(void) {
             break;
     }
 
-    // Dodatkowy warunek przegrzania gdy temperatura wyjściowa wody jest wysoka
+    // Additional overheat safety check based on output water temperature
     if (runtime.temp_main_output > TEMP_OVERHEAT - 5) {
         ESP_LOGW(TAG, "High output water temperature detected: %d°C", runtime.temp_main_output);
         next_state = STATE_OVERHEAT;
     }
     
 state_change:
-    // Zmiana stanu
+    // Handle state transition
     if (next_state != runtime.current_state) {
         runtime.previous_state = runtime.current_state;
         runtime.current_state = next_state;
@@ -579,12 +716,23 @@ state_change:
     }
 }
 
-// ============== TASKI FREERTOS ==============
-// TASK 1: Odczyt czujników (wysoki priorytet)
+// ============== FREERTOS TASKS ==============
+
+/**
+ * @brief Temperature sensor reading task (High priority)
+ * 
+ * Reads all DS18B20 temperature sensors every second.
+ * - Invalid readings are replaced with last known value
+ * - Applies temperature corrections
+ * - Logs temperature values every 60 seconds
+ * 
+ * @param pvParameters Unused
+ */
 void sensor_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     float temperatures[NUM_TEMP_SENSORS];
-    int16_t print_temperatures[NUM_TEMP_SENSORS];
+    int16_t print_temperatures[NUM_TEMP_SENSORS] = { 0 };
+    int16_t last_temperatures[NUM_TEMP_SENSORS] = { 0 };
     uint32_t print_count = 0;
     
     while (1) {
@@ -596,13 +744,14 @@ void sensor_task(void *pvParameters) {
 
         xSemaphoreTake(furnace_mutex, portMAX_DELAY);
         
-        // Odczyt wszystkich czujników DS18B20 (RAW), gdy niepoprawny odczyt - zachowaj poprzednią wartość
+        // Read all DS18B20 sensors (RAW values)
+        // Invalid readings use previous value
         runtime.temp_furnace_raw = temp_sensors[0].is_valid ? (int16_t)temperatures[0] : runtime.temp_furnace_raw;
         runtime.temp_boiler_top_raw = temp_sensors[1].is_valid ? (int16_t)temperatures[1] : runtime.temp_boiler_top_raw;
         runtime.temp_boiler_bottom_raw = temp_sensors[2].is_valid ? (int16_t)temperatures[2] : runtime.temp_boiler_bottom_raw;
         runtime.temp_main_output_raw = temp_sensors[3].is_valid ? (int16_t)temperatures[3] : runtime.temp_main_output_raw;
                 
-        // Zastosowanie korekty temperatur
+        // Apply temperature corrections
         apply_temp_corrections();
 
         if (print_count % 60 == 0) {
@@ -614,7 +763,7 @@ void sensor_task(void *pvParameters) {
             
         xSemaphoreGive(furnace_mutex);
 
-        // Wypisz temperatury co 1 minute
+        // Log temperatures every 60 seconds (every minute)
         if (print_count % 60 == 0) {
             ESP_LOGI(TAG, "Temperatures: Furnace=%d°C, Boiler Top=%d°C, Boiler Bottom=%d°C, Main Output=%d°C",
                      print_temperatures[0],
@@ -623,25 +772,34 @@ void sensor_task(void *pvParameters) {
                      print_temperatures[3]);
         }
 
+
+
         print_count = (print_count + 1) % 60;
         
-        // Co sekundę
+        // Read every 1 second
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
     }
 }
 
-// TASK 2: Aktualizacja histori temperatury pieca (średni priorytet)
+/**
+ * @brief Furnace temperature history update task (Medium priority)
+ * 
+ * Maintains a sliding buffer of furnace temperature readings sampled every minute.
+ * Used by is_temp_rising() to detect temperature trends.
+ * 
+ * @param pvParameters Unused
+ */
 void temp_furnace_history_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    vTaskDelay(pdMS_TO_TICKS(2000)); // Poczekaj 2 sekundy na inicjalizację temperatury
+    vTaskDelay(pdMS_TO_TICKS(2000)); // Wait 2 seconds for temperature initialization
     for (int i = 0; i < BUFFER_SIZE; i++) {
         runtime.temp_furnace_history[i] = runtime.temp_furnace;
     }
     runtime.temp_history_index = 0;
     
     while (1) {
-        // Aktualizuj historię temperatury pieca co 1 minute
+        // Update furnace temperature history every 1 minute
         xSemaphoreTake(furnace_mutex, portMAX_DELAY);
         
         runtime.temp_furnace_history[runtime.temp_history_index] = runtime.temp_furnace;
@@ -654,7 +812,14 @@ void temp_furnace_history_task(void *pvParameters) {
     }
 }
 
-// TASK 3: Główna logika FSM (najwyższy priorytet)
+/**
+ * @brief Main furnace control FSM task (Highest priority)
+ * 
+ * Runs the finite state machine update at 500ms intervals.
+ * Controls all furnace actuators based on current state and sensor inputs.
+ * 
+ * @param pvParameters Unused
+ */
 void control_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     
@@ -663,33 +828,44 @@ void control_task(void *pvParameters) {
         fsm_update();
         xSemaphoreGive(furnace_mutex);
         
-        // FSM aktualizacja co 500ms
+        // FSM update every 500ms
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
     }
 }
 
-// TASK 4: Komunikacja MQTT (niski priorytet)
+/**
+ * @brief MQTT communication task (Low priority)
+ * 
+ * Publishes furnace status to MQTT broker every 5 seconds.
+ * Handles MQTT broker discovery via mDNS and automatic reconnection.
+ * Requires WiFi connection to be active.
+ * 
+ * @param pvParameters Unused
+ */
 void mqtt_task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     char topic[96];
     char payload[512];
     uint32_t send_count = 0;
+    furnace_mqtt_status_t current_status = { 0 };
+    furnace_mqtt_status_t last_status = { 0 };
+    bool is_changed = false;
     
     ESP_LOGI(TAG, "MQTT Task started, waiting for WiFi...");
     
-    // Czekaj na połączenie WiFi
+    // Wait for WiFi connection
     while (!wifi_is_connected()) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    // Inicjalizacja MQTT z retry loop (mDNS discovery)
+    // Initialize MQTT with retry loop (mDNS broker discovery)
     ESP_LOGI(TAG, "WiFi connected, searching for MQTT broker...");
     esp_err_t err;
     while ((err = mqtt_manager_init()) != ESP_OK) {
         ESP_LOGW(TAG, "MQTT init failed (broker not found), retrying in 10s...");
         vTaskDelay(pdMS_TO_TICKS(10000));
         
-        // Sprawdź czy WiFi dalej działa
+        // Check if WiFi is still connected
         if (!wifi_is_connected()) {
             ESP_LOGW(TAG, "WiFi disconnected during MQTT init, waiting...");
             while (!wifi_is_connected()) {
@@ -702,14 +878,14 @@ void mqtt_task(void *pvParameters) {
     ESP_LOGI(TAG, "MQTT initialized successfully");
     
     while (1) {
-        // Sprawdź czy WiFi jest połączone
+        // Check if WiFi is connected
         if (!wifi_is_connected()) {
             ESP_LOGW(TAG, "WiFi not connected, waiting...");
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
         
-        // Sprawdź czy potrzebne jest ponowne wyszukanie brokera
+        // Check if broker rediscovery is needed
         if (mqtt_manager_needs_rediscovery()) {
             ESP_LOGI(TAG, "Broker rediscovery needed, searching...");
             err = mqtt_manager_rediscover_broker();
@@ -722,30 +898,65 @@ void mqtt_task(void *pvParameters) {
             continue;
         }
         
-        // Sprawdź połączenie MQTT
+        // Check MQTT connection
         if (!mqtt_manager_is_connected()) {
             ESP_LOGW(TAG, "MQTT not connected, waiting...");
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        
-        // Publikuj status pieca
-        int msg_id = mqtt_manager_publish_status(topic, payload, sizeof(topic), sizeof(payload));
 
-        if (msg_id >= 0) {
-            if (send_count++ % 20 == 0) {
-                ESP_LOGI(TAG, "Published: msg_id=%d", msg_id);
-            }
-        } else {
-            ESP_LOGE(TAG, "MQTT Publish failed!");
+        xSemaphoreTake(furnace_mutex, portMAX_DELAY);
+
+        current_status.state = runtime.current_state;
+        current_status.temp_furnace = runtime.temp_furnace;
+        current_status.temp_boiler_top = runtime.temp_boiler_top;
+        current_status.temp_boiler_bottom = runtime.temp_boiler_bottom;
+        current_status.temp_main_output = runtime.temp_main_output;
+        current_status.pump_main_on = runtime.pump_main_on;
+        current_status.pump_floor_on = runtime.pump_floor_on;
+        current_status.pump_mixing_power = runtime.pump_mixing_power;
+        current_status.blower_power = runtime.blower_power;
+        current_status.error_flag = runtime.error_flag;
+
+        xSemaphoreGive(furnace_mutex);
+
+        // Compare current status with last status
+        if (memcmp(&current_status, &last_status, sizeof(furnace_mqtt_status_t)) != 0) {
+            memcpy(&last_status, &current_status, sizeof(furnace_mqtt_status_t));
+            is_changed = true;
+            
+            ESP_LOGI(TAG, "Runtime Status Change Detected");
         }
         
-        // Co 5 sekund
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5000));
+        if (is_changed) {
+            is_changed = false;
+
+             // Publish furnace status
+            int msg_id = mqtt_manager_publish_status(topic, payload, sizeof(topic), sizeof(payload));
+
+            if (msg_id >= 0) {
+                if (send_count++ % 600 == 0) {
+                    ESP_LOGI(TAG, "Published: msg_id=%d", msg_id);
+                }
+            } else {
+                ESP_LOGE(TAG, "MQTT Publish failed!");
+            }
+        }
+
+        // Update every 100 milliseconds
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100));
     }
 }
 
-// TASK 5: Watchdog (krytyczny)
+/**
+ * @brief Watchdog task (Critical)
+ * 
+ * Monitors FSM execution health. Triggers system restart if the FSM doesn't
+ * update within 30 seconds, indicating a system hang or deadlock.
+ * Runs every 2 seconds for continuous monitoring.
+ * 
+ * @param pvParameters Unused
+ */
 void watchdog_task(void *pvParameters) {
     while (1) {
         xSemaphoreTake(furnace_mutex, portMAX_DELAY);
@@ -754,18 +965,27 @@ void watchdog_task(void *pvParameters) {
         xSemaphoreGive(furnace_mutex);
         
         uint32_t time_without_change = millis() - last_fsm_update;
-        const uint32_t max_time_in_state = 60 * 1000;
+        const uint32_t max_time_in_state = 30 * 1000;
 
         if (time_without_change > max_time_in_state) {
-            ESP_LOGE(TAG, "WATCHDOG: FSM did not update within 60 seconds! Last state: %s. Restarting now!", state_to_string(current));
+            ESP_LOGE(TAG, "WATCHDOG: FSM did not update within 30 seconds! Last state: %s. Restarting now!", state_to_string(current));
             esp_restart();
         }
         
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Co 10 sekund
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Check every 2 seconds
     }
 }
 
-// ============== FUNKCJE STERUJĄCE ==============
+
+// ============== CONTROL FUNCTIONS ==============
+
+/**
+ * @brief Set main circulation pump state
+ * 
+ * Controls main pump GPIO and logs state changes.
+ * 
+ * @param state true to turn pump on, false to turn off
+ */
 void set_pump_main(bool state) {
     if (runtime.pump_main_on != state) {
         gpio_set_level(config.pin_pump_main, state);
@@ -774,6 +994,13 @@ void set_pump_main(bool state) {
     }
 }
 
+/**
+ * @brief Set floor heating pump state
+ * 
+ * Controls floor pump GPIO and logs state changes.
+ * 
+ * @param state true to turn pump on, false to turn off
+ */
 void set_pump_floor(bool state) {
     if (runtime.pump_floor_on != state) {
         gpio_set_level(config.pin_pump_floor, state);
@@ -782,37 +1009,70 @@ void set_pump_floor(bool state) {
     }
 }
 
+/**
+ * @brief Set mixing pump power level
+ * 
+ * Controls mixing pump TRIAC power for boiler mixing control.
+ * Power is clamped to 0-100%.
+ * 
+ * @param power Power level (0-100%)
+ */
 void set_pump_mixing_power(uint8_t power) {
     if (power > 100) power = 100;
     
     if (runtime.pump_mixing_power != power) {
         runtime.pump_mixing_power = power;
         
-        // TODO: Implementacja sterowania triakiem
+        // TODO: Implement TRIAC control
         //  triac_set_power(config.pin_pump_mixing_control, power);
         
         ESP_LOGI(TAG, "Pump Mixing Power: %d%%", power);
     }
 }
 
+/**
+ * @brief Set blower fan power level
+ * 
+ * Controls blower fan TRIAC power for ignition and blowthrough phases.
+ * Power is clamped to 0-100%.
+ * 
+ * @param power Power level (0-100%)
+ */
 void set_blower_power(uint8_t power) {
     if (power > 100) power = 100;
     
     if (runtime.blower_power != power) {
         runtime.blower_power = power;
         
-        // TODO: Implementacja sterowania triakiem
+        // TODO: Implement TRIAC control
         //  triac_set_power(config.pin_blower_control, power);
         
         ESP_LOGI(TAG, "Blower Power: %d%%", power);
     }
 }
 
-// ============== MAIN ==============
+// ============== MAIN ENTRY POINT ==============
+
+/**
+ * @brief Main application entry point
+ * 
+ * Initializes all system components in sequence:
+ * 1. Non-Volatile Storage (NVS) for persistent configuration
+ * 2. SD card logger with hot-plug detection
+ * 3. Configuration loading (SD card, NVS, or defaults)
+ * 4. WiFi connection and credentials
+ * 5. System time synchronization (SNTP)
+ * 6. GPIO initialization for pumps and TRIAC controls
+ * 7. Temperature sensor initialization (DS18B20)
+ * 8. MQTT manager configuration
+ * 9. FreeRTOS task creation (sensor, control, communication, watchdog)
+ * 
+ * Blocks initialization if critical components fail (NVS, WiFi, sensors).
+ */
 void app_main(void) {
     ESP_LOGI(TAG, "=== Furnace Controller Starting ===");
     
-    // Inicjalizacja NVS
+    // Initialize Non-Volatile Storage (NVS) for configuration persistence
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS erasing and reinitializing...");
@@ -824,7 +1084,7 @@ void app_main(void) {
         esp_restart();
     }
 
-    // Inicjalizacja karty SD
+    // Initialize SD card logger with hot-plug detection
     sd_logger_config_t sd_config = {
         .cd_pin = GPIO_NUM_33,
         .enable_card_detect = true,
@@ -843,7 +1103,7 @@ void app_main(void) {
 
     sd_logger_register_card_event_callback(on_card_event);
 
-    // Wczytywanie konfiguracji z karty SD, NVS lub domyślnej
+    // Load configuration from SD card, NVS, or use defaults
     if (!load_config_from_sd(&config)) {
         if (!config_load_from_nvs(&config)) {
             memcpy(&config, &default_config, sizeof(furnace_config_t));
@@ -852,7 +1112,7 @@ void app_main(void) {
         }
     }
 
-    // Wyświetl aktualną konfigurację
+    // Display current configuration
     ESP_LOGI(TAG, "=== Configuration ===");
     ESP_LOGI(TAG, "Target work temp: %d°C", config.temp_target_work);
     ESP_LOGI(TAG, "Ignition temp: %d°C", config.temp_ignition);
@@ -873,12 +1133,12 @@ void app_main(void) {
            config.temp_correction_boiler_top,
            config.temp_correction_boiler_bottom);
 
-    // Inicjalizacja WiFi
+    // Initialize WiFi
     ESP_LOGI(TAG, "Initializing WiFi...");
     
-    // Wczytywanie danych konfiguracyjnych WiFi
+    // Load WiFi credentials from SD card or NVS
     if (!load_wifi_config_from_sd(wifi_ssid, sizeof(wifi_ssid), wifi_password, sizeof(wifi_password))) {
-        // Jeśli brak na karcie SD, to z NVS
+        // If not on SD card, try loading from NVS
         err = wifi_load_credentials(wifi_ssid, wifi_password);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "Loaded WiFi credentials: SSID='%s'", wifi_ssid);
@@ -907,10 +1167,10 @@ void app_main(void) {
         ESP_LOGI(TAG, "SD card logging enabled");
     }
     
-    // Inicjalizacja czasu
+    // Initialize system time synchronization (SNTP)
     initialize_time();
 
-    // Inicjalizacja GPIO dla pomp ON/OFF
+    // Initialize GPIO pins for pump relays (ON/OFF)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << config.pin_pump_main) | (1ULL << config.pin_pump_floor),
         .mode = GPIO_MODE_OUTPUT,
@@ -920,7 +1180,7 @@ void app_main(void) {
     };
     gpio_config(&io_conf);
     
-    // Inicjalizacja GPIO dla sterowania triakami
+    // Initialize GPIO pins for TRIAC power control
     gpio_config_t triac_conf = {
         .pin_bit_mask = (1ULL << config.pin_pump_mixing_control) | (1ULL << config.pin_blower_control),
         .mode = GPIO_MODE_OUTPUT,
@@ -930,11 +1190,11 @@ void app_main(void) {
     };
     gpio_config(&triac_conf);
     
-    // TODO: Inicjalizacja sterowania triakami
+    // TODO: Initialize TRIAC control drivers
     // triac_init(config.pin_pump_mixing_control);
     // triac_init(config.pin_blower_control);
     
-    // Inicjalizacja czujników temperatury DS18B20
+    // Initialize DS18B20 temperature sensors
     temp_sensors[0].gpio_pin = config.pin_temp_sensor_furnace;
     temp_sensors[0].name = "Furnace";
 
@@ -952,14 +1212,14 @@ void app_main(void) {
         ESP_LOGE(TAG, "Failed to initialize DS18B20 sensors!");
     }
     
-    // Mutex
+    // Create FreeRTOS synchronization mutex
     furnace_mutex = xSemaphoreCreateMutex();
     if (furnace_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create mutex!");
         esp_restart();
     }
     
-    // Inicjalizacja stanu runtime
+    // Initialize runtime state variables
     runtime.current_state = STATE_IDLE;
     runtime.state_entry_time = millis();
     runtime.last_blowthrough_time = millis();
@@ -967,48 +1227,48 @@ void app_main(void) {
     runtime.last_cooling_alert_time = 0;
     runtime.temp_history_index = 0;
     
-    // Wyzeruj historię temperatur
+    // Initialize temperature history buffer to zero
     for (int i = 0; i < BUFFER_SIZE; i++) {
         runtime.temp_furnace_history[i] = 0;
     }
     
-    // Konfiguracja MQTT managera
+    // Configure MQTT manager with data sources and callbacks
     mqtt_manager_set_data_sources(&config, &runtime, furnace_mutex);
     mqtt_manager_set_wifi_callbacks(wifi_is_connected, wifi_get_rssi);
     mqtt_manager_set_config_save_callback(config_save_wrapper);
     
-    ESP_LOGI(TAG, "Creating tasks...");
+    ESP_LOGI(TAG, "Creating FreeRTOS tasks...");
     
-    // Tworzenie tasków
+    // Create FreeRTOS tasks
     BaseType_t result;
     
     result = xTaskCreatePinnedToCore(sensor_task, "Sensors", 4096, NULL, 8, NULL, 0);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Sensors task!");
+        ESP_LOGE(TAG, "Failed to create Sensors task! Error: %s", esp_err_to_name(err));
         esp_restart();
     }
 
     result = xTaskCreatePinnedToCore(temp_furnace_history_task, "FurnaceHist", 2048, NULL, 5, NULL, 0);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Furnace Temperature History task!");
+        ESP_LOGE(TAG, "Failed to create Furnace Temperature History task! Error: %s", esp_err_to_name(err));
         esp_restart();
     }
     
     result = xTaskCreatePinnedToCore(control_task, "Control", 4096, NULL, 10, NULL, 0);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Control task!");
+        ESP_LOGE(TAG, "Failed to create Control task! Error: %s", esp_err_to_name(err));
         esp_restart();
     }
     
     result = xTaskCreatePinnedToCore(mqtt_task, "MQTT", 8192, NULL, 3, NULL, 1);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create MQTT task!");
+        ESP_LOGE(TAG, "Failed to create MQTT task! Error: %s", esp_err_to_name(err));
         esp_restart();
     }
     
     result = xTaskCreatePinnedToCore(watchdog_task, "Watchdog", 2048, NULL, 12, NULL, 1);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Watchdog task!");
+        ESP_LOGE(TAG, "Failed to create Watchdog task! Error: %s", esp_err_to_name(err));
         esp_restart();
     }
     

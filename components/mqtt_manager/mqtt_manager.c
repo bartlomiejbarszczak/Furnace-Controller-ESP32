@@ -193,7 +193,6 @@ esp_err_t mqtt_manager_rediscover_broker(void) {
     
     if (new_broker_uri == NULL) {
         ESP_LOGW(TAG, "Broker not found via mDNS during rediscovery");
-        rediscover_broker_flag = false;  // Clear flag to try again later
         return ESP_ERR_NOT_FOUND;
     }
     
@@ -621,7 +620,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             // Subscribe to command topics
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/ignition", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/shutdown", 0);
-            esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/underfloor_pump", 0);
+            esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/pump/underfloor", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/clear-errors", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/restart", 0);
             esp_mqtt_client_subscribe(client, MQTT_BASE_TOPIC "/command/config", 0);
@@ -637,7 +636,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             if (reconnect_attempt <= 3) {
                 // First 3 attempts - ESP-IDF MQTT client will automatically reconnect
                 ESP_LOGI(TAG, "Reconnecting to last known broker... (%d/3)", reconnect_attempt);
-                // Do nothing - library handles reconnection automatically
             } else {
                 // After 3 failed reconnects - set flag for external task to handle
                 ESP_LOGI(TAG, "3 reconnect attempts failed, triggering broker rediscovery");
@@ -673,14 +671,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             }
             else if (strncmp(event->topic, MQTT_BASE_TOPIC "/command/pump/underfloor", event->topic_len) == 0) {
                 if (furnace_runtime && data_mutex) {
-                    if (strncmp(event->data, "ON", event->data_len) == 0) {
+                    if (strncmp(event->data, "ON", strlen("ON")) == 0) {
                         xSemaphoreTake(data_mutex, portMAX_DELAY);
                         furnace_runtime->runtime_underfloor_pump_enabled = true;
                         xSemaphoreGive(data_mutex);
                         ESP_LOGI(TAG, "Underfloor pump enabled via MQTT");
                         create_message_payload(status_payload, sizeof(status_payload), "underfloor_pump", "ok", "Enabled");
                         mqtt_manager_publish(MQTT_BASE_TOPIC "/command/status", status_payload, 1, false);
-                    } else if (strncmp(event->data, "OFF", event->data_len) == 0) {
+                    } else if (strncmp(event->data, "OFF", strlen("OFF")) == 0) {
                         xSemaphoreTake(data_mutex, portMAX_DELAY);
                         furnace_runtime->runtime_underfloor_pump_enabled = false;
                         xSemaphoreGive(data_mutex);
@@ -694,7 +692,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     }
                 }
             }
-            else if (strncmp(event->topic, MQTT_BASE_TOPIC "/command/clear_errors", event->topic_len) == 0) {
+            else if (strncmp(event->topic, MQTT_BASE_TOPIC "/command/clear-errors", event->topic_len) == 0) {
                 if (furnace_runtime && data_mutex) {
                     xSemaphoreTake(data_mutex, portMAX_DELAY);
                     furnace_runtime->error_flag = false;

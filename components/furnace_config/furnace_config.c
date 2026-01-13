@@ -9,7 +9,7 @@
 
 static const char *TAG = "CONFIG";
 
-// Default configuration
+// Default configuration values
 const furnace_config_t default_config = {
     .temp_target_work = 60,
     .temp_ignition = 25,
@@ -51,7 +51,7 @@ const furnace_config_t default_config = {
     .pin_temp_sensor_main_output = GPIO_NUM_19,
 };
 
-// Save configuration to NVS
+// Save configuration to NVS (Non-Volatile Storage)
 bool config_save_to_nvs(const furnace_config_t *config) {
     nvs_handle_t nvs_handle;
     esp_err_t err;
@@ -81,7 +81,7 @@ bool config_save_to_nvs(const furnace_config_t *config) {
     }
 }
 
-// Load configuration from NVS
+// Load configuration from NVS (Non-Volatile Storage)
 bool config_load_from_nvs(furnace_config_t *config) {
     nvs_handle_t nvs_handle;
     esp_err_t err;
@@ -105,7 +105,12 @@ bool config_load_from_nvs(furnace_config_t *config) {
     }
 }
 
-// Convert state to string
+/**
+ * @brief Convert furnace state to human-readable string
+ * 
+ * @param state Furnace state to convert
+ * @return String representation of state
+ */
 const char* state_to_string(furnace_state_t state) {
     switch(state) {
         case STATE_IDLE: return "IDLE";

@@ -186,7 +186,7 @@ esp_err_t ds18b20_init(ds18b20_sensor_t *sensors, uint8_t num_sensors) {
         gpio_config_t io_conf = {
             .pin_bit_mask = (1ULL << sensors[i].gpio_pin),
             .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_ENABLE,  // Important: DS18B20 needs pull-up
+            .pull_up_en = GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE
         };
