@@ -59,7 +59,9 @@ void initialize_time(void);
  * @return true if both NVS and SD saves succeed, false otherwise
  */
 bool config_save_wrapper(void) {
-    bool result_nvs = config_save_to_nvs(&config);
+    xSemaphoreTake(furnace_mutex, portMAX_DELAY);
+    bool result_nvs = config_save_to_nvs(&config, &runtime.error_flag, &runtime.error_code);
+    xSemaphoreGive(furnace_mutex);
     bool result_sd = save_config_to_sd(&config);
 
     return result_nvs && result_sd;
@@ -578,10 +580,11 @@ void fsm_update(void) {
             set_pump_mixing_power(0);
             
             // Transitions:
-            // → IDLE: timeout 15 minutes
-            if (time_in_state > (15 * 60 * 1000)) {
+            // → IDLE: timeout 30 minutes
+            if (time_in_state > (30 * 60 * 1000)) {
                 next_state = STATE_IDLE;
                 runtime.error_flag = true;
+                runtime.error_code |= FURNACE_ERROR_IGNITION_TIMEOUT;
                 ESP_LOGE(TAG, "Ignition timeout!");
             }
             // → WORK: target work temperature reached
@@ -740,6 +743,10 @@ void sensor_task(void *pvParameters) {
         
         if (success < NUM_TEMP_SENSORS) {
             ESP_LOGW(TAG, "Only %d/%d sensors read successfully", success, NUM_TEMP_SENSORS);
+            xSemaphoreTake(furnace_mutex, portMAX_DELAY);
+            runtime.error_flag = true;
+            runtime.error_flag |= FURNACE_ERROR_SENSOR_FAILURE;
+            xSemaphoreGive(furnace_mutex);
         }
 
         xSemaphoreTake(furnace_mutex, portMAX_DELAY);
@@ -917,6 +924,7 @@ void mqtt_task(void *pvParameters) {
         current_status.pump_mixing_power = runtime.pump_mixing_power;
         current_status.blower_power = runtime.blower_power;
         current_status.error_flag = runtime.error_flag;
+        current_status.error_code = runtime.error_code;
 
         xSemaphoreGive(furnace_mutex);
 
@@ -1103,14 +1111,29 @@ void app_main(void) {
 
     sd_logger_register_card_event_callback(on_card_event);
 
+    // Create FreeRTOS synchronization mutex
+    furnace_mutex = xSemaphoreCreateMutex();
+    if (furnace_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex!");
+        esp_restart();
+    }
+
     // Load configuration from SD card, NVS, or use defaults
     if (!load_config_from_sd(&config)) {
-        if (!config_load_from_nvs(&config)) {
+        xSemaphoreTake(furnace_mutex, portMAX_DELAY);
+
+        esp_err_t err = config_load_from_nvs(&config, &runtime.error_flag, &runtime.error_code);
+        if (err != ESP_OK) {
             memcpy(&config, &default_config, sizeof(furnace_config_t));
-            config_save_to_nvs(&config);
+            config_save_to_nvs(&config, &runtime.error_flag, &runtime.error_code);
             sd_logger_save_config(&config, sizeof(furnace_config_t));
+            
         }
+
+        xSemaphoreGive(furnace_mutex);
     }
+
+    
 
     // Display current configuration
     ESP_LOGI(TAG, "=== Configuration ===");
@@ -1210,13 +1233,6 @@ void app_main(void) {
     err = ds18b20_init(temp_sensors, NUM_TEMP_SENSORS);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize DS18B20 sensors!");
-    }
-    
-    // Create FreeRTOS synchronization mutex
-    furnace_mutex = xSemaphoreCreateMutex();
-    if (furnace_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create mutex!");
-        esp_restart();
     }
     
     // Initialize runtime state variables

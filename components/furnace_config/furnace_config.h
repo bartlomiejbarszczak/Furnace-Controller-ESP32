@@ -60,7 +60,7 @@ typedef struct {
     
 } furnace_config_t;
 
-// ============== RUNTIME STATE STRUCTURE ==============
+// Runtime state structure
 typedef enum {
     STATE_IDLE,             // Idle state
     STATE_IGNITION,         // Ignition phase
@@ -70,6 +70,17 @@ typedef enum {
     STATE_OVERHEAT,         // Overheat safety state
     STATE_COOLING           // Emergency cooling state
 } furnace_state_t;
+
+// Max 8 error codes (due to uint8_t storage)
+typedef enum {
+    FURNACE_ERROR_NONE              = 0,
+    FURNACE_ERROR_IGNITION_TIMEOUT  = (1 << 0),     // Ignition failed within timeout period
+    FURNACE_ERROR_SENSOR_FAILURE    = (1 << 1),     // Temperature sensor failure detected
+    FURNACE_ERROR_FAILED_NVS_LOAD   = (1 << 2),     // Failed to load configuration from NVS
+    FURNACE_ERROR_FAILED_NVS_SAVE   = (1 << 3),     // Failed to save configuration to NVS
+    FURNACE_ERROR_TRIAC_FAILURE     = (1 << 4),     // TRIAC control failure detected
+    FURNACE_ERROR_UNKNOWN           = (1 << 7)      // Unknown error
+} furnace_error_code_t_;
 
 #define BUFFER_SIZE 5  // Temperature history buffer size
 
@@ -112,6 +123,7 @@ typedef struct {
     bool manual_ignition_requested;
     bool runtime_underfloor_pump_enabled;
     bool error_flag;
+    uint8_t error_code; // Bitfield of furnace_error_code_t_
     bool is_changed; 
     
 } furnace_runtime_t;
@@ -121,6 +133,7 @@ typedef struct {
     bool pump_main_on;
     bool pump_floor_on;
     bool error_flag;
+    uint8_t error_code;
     uint8_t pump_mixing_power;
     uint8_t blower_power;
     
@@ -143,14 +156,15 @@ extern const furnace_config_t default_config;
  * @param config Pointer to configuration structure
  * @return true if successful, false otherwise
  */
-bool config_save_to_nvs(const furnace_config_t *config);
+bool config_save_to_nvs(const furnace_config_t *config, bool *error_flag, uint8_t *error_register) ;
 
-/**
- * @brief Load configuration from NVS
+/** @brief Load configuration from NVS
  * @param config Pointer to configuration structure to load into
- * @return true if successful, false otherwise
+ * @param error_flag Pointer to runtime boolean flag variable set to true if error occurs
+ * @param error_register Pointer to runtime uint8_t variable to store error codes
+ * @return ESP_OK if successful, error code otherwise
  */
-bool config_load_from_nvs(furnace_config_t *config);
+esp_err_t config_load_from_nvs(furnace_config_t *config, bool *error_flag, uint8_t *error_register);
 
 /**
  * @brief Convert furnace state to string

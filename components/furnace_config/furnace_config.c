@@ -52,19 +52,27 @@ const furnace_config_t default_config = {
 };
 
 // Save configuration to NVS (Non-Volatile Storage)
-bool config_save_to_nvs(const furnace_config_t *config) {
+bool config_save_to_nvs(const furnace_config_t *config, bool *error_flag, uint8_t *error_register) {
     nvs_handle_t nvs_handle;
     esp_err_t err;
     
     err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        if (error_flag && error_register) {
+            *error_flag = true;
+            *error_register |= FURNACE_ERROR_FAILED_NVS_SAVE;
+        }
         return false;
     }
-    
+
     err = nvs_set_blob(nvs_handle, NVS_CONFIG_KEY, config, sizeof(furnace_config_t));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "NVS write failed: %s", esp_err_to_name(err));
+        if (error_flag && error_register) {
+            *error_flag = true;
+            *error_register |= FURNACE_ERROR_FAILED_NVS_SAVE;
+        }
         nvs_close(nvs_handle);
         return false;
     }
@@ -82,15 +90,23 @@ bool config_save_to_nvs(const furnace_config_t *config) {
 }
 
 // Load configuration from NVS (Non-Volatile Storage)
-bool config_load_from_nvs(furnace_config_t *config) {
+esp_err_t config_load_from_nvs(furnace_config_t *config, bool *error_flag, uint8_t *error_register) {
     nvs_handle_t nvs_handle;
     esp_err_t err;
     
     err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGW(TAG, "NVS open failed (first boot?), using default config");
-        return false;
-    }
+        return err;
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        if (error_flag && error_register) {
+            *error_flag = true;
+            *error_register |= FURNACE_ERROR_FAILED_NVS_LOAD;
+        }
+            
+        return err;
+    } 
     
     size_t required_size = sizeof(furnace_config_t);
     err = nvs_get_blob(nvs_handle, NVS_CONFIG_KEY, config, &required_size);
@@ -98,10 +114,14 @@ bool config_load_from_nvs(furnace_config_t *config) {
     
     if (err == ESP_OK && required_size == sizeof(furnace_config_t)) {
         ESP_LOGI(TAG, "Configuration loaded from NVS");
-        return true;
+        return ESP_OK;
     } else {
+        if (error_flag && error_register) {
+            *error_flag = true;
+            *error_register |= FURNACE_ERROR_FAILED_NVS_LOAD;
+        }
         ESP_LOGW(TAG, "NVS read failed: %s, using default config", esp_err_to_name(err));
-        return false;
+        return err;
     }
 }
 

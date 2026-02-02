@@ -278,6 +278,7 @@ int mqtt_manager_publish_status(char *topic, char *payload, size_t topic_size, s
     uint8_t blower_power = furnace_runtime->blower_power;
 
     bool error_flag = furnace_runtime->error_flag;
+    uint8_t error_code = furnace_runtime->error_code;
 
     xSemaphoreGive(data_mutex);
 
@@ -299,6 +300,7 @@ int mqtt_manager_publish_status(char *topic, char *payload, size_t topic_size, s
                  "\"blower\":{\"power\":%d},"
                  "\"system\":{"
                    "\"error\":\"%s\","
+                   "\"error_code\":%d,"
                    "\"rssi\":%d,"
                    "\"heap\":%lu"
                  "}"
@@ -309,7 +311,8 @@ int mqtt_manager_publish_status(char *topic, char *payload, size_t topic_size, s
                  pump_floor_on ? "ON" : "OFF",
                  pump_mixing_power,
                  blower_power,
-                 error_flag ? "ERROR" : "NONE",
+                 error_flag ? "ERROR" : "OK",
+                 error_code,
                  wifi_get_rssi(), 
                  esp_get_free_heap_size());
 
