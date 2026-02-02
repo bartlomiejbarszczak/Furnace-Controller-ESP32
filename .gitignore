@@ -3,6 +3,5 @@
 .vscode/
 build
 cmake-build-debug/
-topics.txt
 managed_components/
 dependencies.lock

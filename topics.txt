@@ -1,0 +1,17 @@
+MQTT Topics - Subscribe:
+    furnace/command/ignition        - Trigger manual ignition
+    furnace/command/shutdown        - Trigger manual shutdown
+    furnace/command/pump/underfloor - data:
+                                    ON  - runtime underfloor pump enabled
+                                    OFF - runtime underfloor pump disabled
+    furnace/command/clear-errors    - Clear last runtime errors
+    furnace/command/restart         - Restart ESP32
+    furnace/command/config          - Update configuration (JSON payload)
+    furnace/command/config/get      - Request current configuration
+
+MQTT Topics - Publish:
+    furnace/status              - Periodic status updates
+    furnace/config/get-response - Current configuration (response to get)
+    furnace/command/status      - Response to send commands - JSON{command, status, message}
+    furnace/availability        - LWT (online/offline)
+
