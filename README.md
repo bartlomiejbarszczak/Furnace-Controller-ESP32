@@ -1,6 +1,6 @@
 # Furnace Controller ESP32 
 
-A robust, feature-rich ESP32-based furnace controller for managing multiple circulation pumps, floor heating pumps, boiler mixing pump, and blower. Includes SD card logging, WiFi connectivity, and MQTT integration for remote monitoring and control.
+ESP32-based furnace controller for managing multiple circulation pumps, floor heating pumps, boiler mixing pump, and blower. Includes SD card logging, WiFi connectivity, and MQTT integration for remote monitoring and control.
 
 ## Features
 
@@ -27,11 +27,8 @@ A robust, feature-rich ESP32-based furnace controller for managing multiple circ
   - Log rotation after size threshold
   - FatFs filesystem with wear leveling through buffering
 
-### Configuration
-- 22 tunable parameters stored in NVS flash
-- Remote configuration via MQTT JSON payloads
-- Temperature calibration offsets for each sensor
-- GPIO pin mapping flexibility
+<!-- ## Diagram -->
+<!-- //Connection diagram coming soon. -->
 
 ## Hardware Requirements
 
@@ -79,9 +76,8 @@ SD Card (SDMMC 1-bit mode):
 
 ### Installation
 
-1. **Clone the repository**
+1. **Clone the repository and then**
    ```bash
-   git clone https://github.com/bartlomiejbarszczak/Furnace-Controller-ESP32.git
    cd Furnace-Controller-ESP32
    ```
 
@@ -111,6 +107,46 @@ SD Card (SDMMC 1-bit mode):
    ```bash
    idf.py monitor
    ```
+
+## Project Structure
+
+```
+furnace-controller/
+├── main/
+│   ├── main.c                    # Main application and FSM
+│   ├── CMakeLists.txt
+│   └── idf_component.yml         # Component dependencies
+│
+├── components/
+│   ├── ds18b20/                  # Temperature sensor driver
+│   ├── furnace_config/           # Configuration management
+│   ├── mqtt_manager/             # MQTT communication & mDNS
+│   ├── sd_logger/                # SD card logging (FatFs)
+│   └── wifi_manager/             # WiFi connectivity
+│
+├── CMakeLists.txt                # Root project configuration
+├── topics.txt                    # MQTT topics documentation
+└── README.md                     # This file
+```
+
+## System Architecture
+
+### Task Priority (Higher = Higher Priority)
+1. **Watchdog Task** (Priority 12) - Monitors FSM execution health
+2. **Control Task** (Priority 10) - FSM update at 500ms interval
+3. **Sensor Task** (Priority 8) - Temperature reading at 1s interval
+4. **Furnace History Task** (Priority 5) - Temperature history buffer update
+5. **MQTT Task** (Priority 3) - Status publishing on change
+
+### Timing
+```
+Sensor Reading:       1 second
+FSM Update:           500 milliseconds
+Temperature History:  60 seconds
+Status Publish:       Publish on change (100ms task)
+SD Card Flush:        30 seconds
+Watchdog Check:       2 seconds (max 30s without FSM update)
+```
 
 ## MQTT Configuration
 
@@ -144,48 +180,6 @@ furnace/command/clear-errors       - Clear error flag
 furnace/command/restart            - Restart ESP32
 furnace/command/config             - JSON configuration update
 furnace/command/config/get         - Request current configuration
-```
-
-### Example MQTT Payloads
-
-**Status Update** (published):
-```json
-{
-  "state": "WORK",
-  "temperatures": {
-    "furnace": 65,
-    "boiler_top": 58,
-    "boiler_bottom": 42,
-    "main_output": 60
-  },
-  "pumps": {
-    "main": "ON",
-    "floor": "OFF",
-    "mixing_power": 75
-  },
-  "blower": { "power": 0 },
-  "system": {
-    "error": "OK",
-    "error_code": 0,
-    "rssi": -45,
-    "heap": 156432
-  }
-}
-```
-
-**Configuration Update** (publish to `furnace/command/config`):
-```json
-{
-  "temp_target_work": 65,
-  "temp_ignition": 28,
-  "temp_shutdown": 50,
-  "blower_enabled": true,
-  "blower_power_min": 30,
-  "blower_power_max": 100,
-  "time_blowthrough_sec": 60,
-  "time_blowthrough_interval_min": 10,
-  "pump_floor_enabled": true
-}
 ```
 
 ## Configuration Parameters
@@ -232,65 +226,31 @@ furnace/command/config/get         - Request current configuration
 | `temp_correction_boiler_top` | -5 to 5 | 0 | °C |
 | `temp_correction_boiler_bottom` | -5 to 5 | 0 | °C |
 
-## Project Structure
+## Default Configuration
 
-```
-furnace-controller/
-├── main/
-│   ├── main.c                    # Main application and FSM
-│   ├── CMakeLists.txt
-│   └── idf_component.yml         # Component dependencies
-│
-├── components/
-│   ├── ds18b20/                  # Temperature sensor driver
-│   │   ├── ds18b20.c
-│   │   ├── ds18b20.h
-│   │   └── CMakeLists.txt
-│   │
-│   ├── furnace_config/           # Configuration management
-│   │   ├── furnace_config.c
-│   │   ├── furnace_config.h
-│   │   └── CMakeLists.txt
-│   │
-│   ├── mqtt_manager/             # MQTT communication & mDNS
-│   │   ├── mqtt_manager.c
-│   │   ├── mqtt_manager.h
-│   │   └── CMakeLists.txt
-│   │
-│   ├── sd_logger/                # SD card logging (FatFs)
-│   │   ├── sd_logger.c
-│   │   ├── sd_logger.h
-│   │   └── CMakeLists.txt
-│   │
-│   └── wifi_manager/             # WiFi connectivity
-│       ├── wifi_manager.c
-│       ├── wifi_manager.h
-│       └── CMakeLists.txt
-│
-├── CMakeLists.txt                # Root project configuration
-├── sdkconfig                     # ESP-IDF configuration
-├── topics.txt                    # MQTT topics documentation
-└── README.md                     # This file
-```
+On boot, the controller loads:
+1. Configuration from SD card (`/furnace_config.bin`) if available
+2. Configuration from NVS flash if SD not available
+3. Default hardcoded configuration if neither available
 
-## System Architecture
+The default configuration is intended for typical heating systems and may require adjustment for specific installations. Adjust via MQTT or re-flash with modified `default_config` in `furnace_config.c`.
 
-### Task Priority (Higher = Higher Priority)
-1. **Watchdog Task** (Priority 12) - Monitors FSM execution health
-2. **Control Task** (Priority 10) - FSM update at 500ms interval
-3. **Sensor Task** (Priority 8) - Temperature reading at 1s interval
-4. **Furnace History Task** (Priority 5) - Temperature history buffer update
-5. **MQTT Task** (Priority 3) - Status publishing on change
+## Safety Features
 
-### Timing
-```
-Sensor Reading:       1 second
-FSM Update:           500 milliseconds
-Temperature History:  60 seconds
-Status Publish:       Publish on change (100ms task)
-SD Card Flush:        30 seconds
-Watchdog Check:       2 seconds (max 30s without FSM update)
-```
+- **Overheat Detection** (>95°C): All pumps engaged, blower disabled
+- **Freeze Protection** (<4°C): Emergency cooling circulation (max once per 30 min)
+- **Ignition Timeout**: 30-minute maximum, error flag set if exceeded
+- **Watchdog**: Restarts system if FSM doesn't update for 30 seconds
+
+## Wear Leveling
+- Auto-flush every 30 seconds or when buffer >75% full
+- Log rotation at 10MB prevents single file bloat
+
+## TODOs
+
+- [ ] **Display Integration**
+
+- [ ] **WiFi Configuration Portal (AP Mode)**
 
 ## Troubleshooting
 
@@ -312,45 +272,6 @@ Watchdog Check:       2 seconds (max 30s without FSM update)
 - **CRC errors**: Check One-Wire wiring, try reducing cable length, adjust timings.
 - **Sensor missing**: Verify GPIO pin in config, check DS18B20 parasite power mode
 
-## Default Configuration
-
-On boot, the controller loads:
-1. Configuration from SD card (`/furnace_config.bin`) if available
-2. Configuration from NVS flash if SD not available
-3. Default hardcoded configuration if neither available
-
-The default configuration is optimized for typical heating systems. Adjust via MQTT or re-flash with modified `default_config` in `furnace_config.c`.
-
-## Safety Features
-
-- **Overheat Detection** (>95°C): All pumps engaged, blower disabled
-- **Freeze Protection** (<4°C): Emergency cooling circulation (max once per 30 min)
-- **Ignition Timeout**: 30-minute maximum, error flag set if exceeded
-- **Watchdog**: Restarts system if FSM doesn't update for 30 seconds
-
-## Wear Leveling
-- Auto-flush every 30 seconds or when buffer >75% full
-- Log rotation at 10MB prevents single file bloat
-
-## TODOs
-
-### Display Integration
-- [ ] Add display driver component (OLED/LCD/TFT SPI)
-- [ ] Implement status screen showing:
-  - Current furnace state
-  - All 4 temperatures in real-time
-  - Pumps and blower status
-  - WiFi & MQTT connection status
-- [ ] Create menu system for parameter adjustment
-- [ ] Implement parameter change persistence
-
-### WiFi Configuration Portal (AP Mode)
-- [ ] Implement WiFi AP mode when credentials missing or all attempts failed
-- [ ] Create web portal on `192.168.100.1`
-- [ ] Build HTML form for SSID/password entry
-- [ ] Auto-restart ESP32 after credential submission
-- [ ] Save credentials to both NVS and SD card
-
 ## Contributing
 
 To extend functionality:
@@ -358,3 +279,7 @@ To extend functionality:
 2. Create CMakeLists.txt for each component
 3. Add to main CMakeLists.txt `REQUIRES` list
 4. Update configuration structure if adding new parameters
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
