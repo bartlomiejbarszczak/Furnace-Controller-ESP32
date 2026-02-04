@@ -4,6 +4,7 @@
 build
 cmake-build-debug/
 managed_components/
+components/sd_card/
 dependencies.lock
 sdkconfig
 sdkconfig.ci
