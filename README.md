@@ -5,7 +5,7 @@ A robust, feature-rich ESP32-based furnace controller for managing multiple circ
 ## Features
 
 ### Core Functionality
-- **Multi-State FSM Control**: 7-state finite state machine (IDLE, IGNITION, WORK, BLOWTHROUGH, SHUTDOWN, OVERHEAT, COOLING)
+- **Multi-State FSM Control**: 7-state finite state machine
 - **4 Temperature Sensors**: DS18B20 digital temperature monitoring for furnace, boiler (top/bottom), and main water output
 - **Pump Control**: 
   - Main circulation pump (on/off)
@@ -42,7 +42,7 @@ A robust, feature-rich ESP32-based furnace controller for managing multiple circ
 - **4x DS18B20** Temperature sensors (GPIO 4, 5, 18, 19)
 - **Relay Modules** for pump control (GPIO 25, 26)
 - **TRIAC Driver** for power control (GPIO 27, 32)
-- **SD Card Slot** with SPI interface (1-bit mode)
+- **SD Card Slot** with SDMMC interface (1-bit mode)
   - CLK: GPIO 14
   - CMD: GPIO 15
   - D0: GPIO 2
@@ -73,7 +73,7 @@ SD Card (SDMMC 1-bit mode):
 ## Getting Started
 
 ### Prerequisites
-- **ESP-IDF v6.1.0** or later ([Installation Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/))
+- **ESP-IDF v6.1.0** or later
 - **Visual Studio Code** with ESP-IDF extension
 - **Python 3.7+** (required by ESP-IDF)
 
@@ -95,7 +95,6 @@ SD Card (SDMMC 1-bit mode):
    idf.py menuconfig
    ```
    - Select your ESP32 board variant
-   - Configure WiFi SSID/password (optional - can be set via MQTT)
    - Adjust other ESP-IDF settings as needed
 
 4. **Build the project**
@@ -112,23 +111,6 @@ SD Card (SDMMC 1-bit mode):
    ```bash
    idf.py monitor
    ```
-
-### VSCode Setup
-
-1. **Install Extension Pack for ESP-IDF**
-   - Open VSCode Extensions (Ctrl+Shift+X)
-   - Search for "ESP-IDF"
-   - Install the official Espressif extension
-
-2. **Configure Extension**
-   - Press `Ctrl+Shift+P` → "ESP-IDF: Configure project ESP-IDF extension"
-   - Set IDF_PATH and Python interpreter path
-   - Select your board (ESP32)
-
-3. **Quick Commands**
-   - `Ctrl+Shift+P` → "ESP-IDF: Build project"
-   - `Ctrl+Shift+P` → "ESP-IDF: Flash device"
-   - `Ctrl+Shift+P` → "ESP-IDF: Monitor device"
 
 ## MQTT Configuration
 
@@ -346,13 +328,11 @@ The default configuration is optimized for typical heating systems. Adjust via M
 - **Ignition Timeout**: 30-minute maximum, error flag set if exceeded
 - **Watchdog**: Restarts system if FSM doesn't update for 30 seconds
 
-## Logging & Statistics
-
-### Wear Leveling
+## Wear Leveling
 - Auto-flush every 30 seconds or when buffer >75% full
 - Log rotation at 10MB prevents single file bloat
 
-## TODOs & Future Features
+## TODOs
 
 ### Display Integration
 - [ ] Add display driver component (OLED/LCD/TFT SPI)

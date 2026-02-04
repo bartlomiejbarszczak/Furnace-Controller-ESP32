@@ -5,3 +5,6 @@ build
 cmake-build-debug/
 managed_components/
 dependencies.lock
+sdkconfig
+sdkconfig.ci
+sdkconfig.old
