@@ -16,6 +16,7 @@
 #include "ds18b20.h"
 #include "wifi_manager.h"
 #include "ota_manager.h"
+#include "ap_web_server.h"
 
 // ============== DEFINES ==============
 #define TEMP_OVERHEAT 95        // Overheat temperature threshold [°C]
@@ -1177,10 +1178,8 @@ void app_main(void) {
                 ESP_LOGW(TAG, "Failed to save loaded from NVS WiFi credentials to SD card");
             }
         } else {
-            ESP_LOGE(TAG, "No WiFi credentials found");
-            vTaskDelay(pdMS_TO_TICKS(10000000));
-            esp_restart();
-            //TODO: Start AP mode for configuration
+            ESP_LOGE(TAG, "No WiFi credentials found, starting AP config mode...");
+            ap_web_server_start();
         }
     }
 
