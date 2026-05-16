@@ -1,0 +1,22 @@
+# Partition table for ESP32 furnace controller with OTA support
+#
+# Flash layout (total 4MB):
+#   0x0000  –  0x8FFF   Bootloader (ESP-IDF default, not listed here)
+#   0x9000  –  0xCFFF   NVS                 (16 KB)
+#   0xD000  –  0xEFFF   OTA data            ( 8 KB, two sectors for safe write)
+#   0xF000  –  0xFFFF   PHY init data       ( 4 KB)
+#   0x10000 – 0x18FFFF  ota_0 app slot      (1.5 MB)
+#   0x190000– 0x27FFFF  ota_1 app slot      (1.5 MB)
+#   0x280000– 0x3FFFFF  Reserved / future   (1.5 MB)
+#
+# Notes:
+#   - No factory partition: anti-rollback requires this (see ESP-IDF docs)
+#   - Each OTA slot is 0x180000 (1572864 bytes = 1.5 MB)
+#     Adjust if your firmware grows beyond ~1.4 MB after linking
+
+# Name,     Type,  SubType,  Offset,    Size,    Flags
+nvs,        data,  nvs,      0x9000,    0x4000,
+otadata,    data,  ota,      0xD000,    0x2000,
+phy_init,   data,  phy,      0xF000,    0x1000,
+ota_0,      app,   ota_0,    0x10000,   0x180000,
+ota_1,      app,   ota_1,    0x190000,  0x180000,

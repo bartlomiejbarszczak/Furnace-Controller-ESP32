@@ -15,6 +15,7 @@
 #include "sd_logger.h"
 #include "ds18b20.h"
 #include "wifi_manager.h"
+#include "ota_manager.h"
 
 // ============== DEFINES ==============
 #define TEMP_OVERHEAT 95        // Overheat temperature threshold [°C]
@@ -1092,6 +1093,11 @@ void app_main(void) {
         esp_restart();
     }
 
+    // OTA rollback self-test — must run as early as possible after NVS init.
+    // Confirms the new firmware is healthy after an OTA update, or rolls back
+    // to the previous working firmware if checks fail.
+    ota_init();
+
     // Initialize SD card logger with hot-plug detection
     sd_logger_config_t sd_config = {
         .cd_pin = GPIO_NUM_33,
@@ -1171,8 +1177,9 @@ void app_main(void) {
                 ESP_LOGW(TAG, "Failed to save loaded from NVS WiFi credentials to SD card");
             }
         } else {
-            ESP_LOGW(TAG, "No WiFi credentials found");
+            ESP_LOGE(TAG, "No WiFi credentials found");
             vTaskDelay(pdMS_TO_TICKS(10000000));
+            esp_restart();
             //TODO: Start AP mode for configuration
         }
     }
@@ -1288,5 +1295,11 @@ void app_main(void) {
         esp_restart();
     }
     
+    result = xTaskCreatePinnedToCore(ota_task, "OTA", 8192, NULL, 2, NULL, 1);
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create OTA task! Error: %s", esp_err_to_name(err));
+        // OTA is non-critical — log the error but do not restart
+    }
+
     ESP_LOGI(TAG, "=== System Ready ===");
 }
