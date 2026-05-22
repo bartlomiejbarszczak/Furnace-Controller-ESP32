@@ -9,4 +9,4 @@ dependencies.lock
 sdkconfig
 sdkconfig.ci
 sdkconfig.old
-deploy.sh
+deploy_firmware.sh

@@ -185,38 +185,60 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-void ap_web_server_start(const char *current_ssid, const char *current_password)
+static bool s_ap_running = false;
+
+bool ap_web_server_is_running(void)
+{
+    return s_ap_running;
+}
+
+esp_err_t ap_web_server_init(const char *current_ssid, const char *current_password)
 {
     // Prepare safe strings for display
     char ssid_display[32] = {0};
-    char pass_display[64] = {0};
 
     if (current_ssid) {
         strncpy(ssid_display, current_ssid, sizeof(ssid_display) - 1);
-    }
-    if (current_password) {
-        strncpy(pass_display, current_password, sizeof(pass_display) - 1);
     }
 
     // Generate HTML page with current values
     int len = snprintf(html_page, sizeof(html_page), html_template,
                        ssid_display[0] ? ssid_display : "(none)",
                        ssid_display);
-    if (len < 0 || len >= sizeof(html_page)) {
+    if (len < 0 || len >= (int)sizeof(html_page)) {
         ESP_LOGE(TAG, "HTML page buffer too small");
     }
 
     ESP_LOGI(TAG, "AP mode - showing current SSID: %s", ssid_display);
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t ret;
+
+    ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ret = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Event handler register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     wifi_config_t wifi_config = {
         .ap = {
@@ -229,15 +251,20 @@ void ap_web_server_start(const char *current_ssid, const char *current_password)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "AP mode started. Connect to SSID: %s", AP_SSID);
-    ESP_LOGI(TAG, "Open http://%s in your browser", AP_IP);
-
-    start_web_server();
-
-    // Block indefinitely - this function never returns
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
+        return ret;
     }
+
+    httpd_handle_t server = start_web_server();
+    if (server == NULL) {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+        return ESP_FAIL;
+    }
+
+    s_ap_running = true;
+    ESP_LOGI(TAG, "AP mode active. SSID: %s  URL: http://%s", AP_SSID, AP_IP);
+    return ESP_OK;
 }

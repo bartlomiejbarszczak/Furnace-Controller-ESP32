@@ -9,7 +9,7 @@ extern "C" {
 // ============== CONFIGURATION ==============
 
 /** Raspberry Pi HTTP server base URL (no trailing slash) */
-#define OTA_SERVER_BASE_URL     "http://192.168.2.161:"
+#define OTA_SERVER_BASE_URL     "http://192.168.2.161:8162"
 
 /** Path to version descriptor JSON on the server */
 #define OTA_VERSION_JSON_URL    OTA_SERVER_BASE_URL "/version.json"

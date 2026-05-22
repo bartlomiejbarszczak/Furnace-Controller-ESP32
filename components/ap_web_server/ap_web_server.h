@@ -2,20 +2,31 @@
 #define AP_WEB_SERVER_H
 
 #include "esp_err.h"
+#include <stdbool.h>
 
 /**
- * @brief Start AP mode with web server for WiFi configuration
+ * @brief Initialize AP mode and start the configuration web server
  *
- * Creates an open Access Point "FurnaceConfig" and starts an HTTP server.
- * Serves an HTML form at http://192.168.4.1 where users can enter WiFi credentials.
- * When credentials are submitted, they are saved to NVS and the device restarts.
+ * Creates an open Access Point "FurnaceConfig" and starts an HTTP server
+ * as a background service. Returns immediately — does NOT block.
  *
- * @param current_ssid Current SSID that was attempted (can be NULL or empty)
- * @param current_password Current password that was attempted (can be NULL or empty)
- *                        Note: password is only for display, not filled in the form
+ * The HTTP server serves a config page at http://192.168.4.1 where users
+ * can enter WiFi credentials. On submission the credentials are saved to
+ * NVS and the device restarts automatically.
  *
- * This function blocks until credentials are received and saved, then triggers a restart.
+ * Safe to call from app_main before FreeRTOS tasks are created; the HTTP
+ * server runs in its own IDF-managed task.
+ *
+ * @param current_ssid  Last attempted SSID shown in the form (NULL or "" is fine)
+ * @param current_password  Unused, kept for API compatibility (password is never pre-filled)
+ * @return ESP_OK on success, or an esp_err_t code on failure
  */
-void ap_web_server_start(const char *current_ssid, const char *current_password);
+esp_err_t ap_web_server_init(const char *current_ssid, const char *current_password);
+
+/**
+ * @brief Check whether the AP config server is currently running
+ * @return true if AP mode is active
+ */
+bool ap_web_server_is_running(void);
 
 #endif // AP_WEB_SERVER_H

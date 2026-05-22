@@ -183,6 +183,64 @@ esp_err_t wifi_erase_credentials(void)
     return ret;
 }
 
+uint8_t wifi_get_failed_boot_count(void)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (ret != ESP_OK) {
+        return 0;
+    }
+
+    uint8_t count = 0;
+    nvs_get_u8(handle, "fail_count", &count); // silently ignore NOT_FOUND
+    nvs_close(handle);
+    return count;
+}
+
+void wifi_increment_failed_boot_count(void)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for fail count increment");
+        return;
+    }
+
+    uint8_t count = 0;
+    nvs_get_u8(handle, "fail_count", &count); // silently ignore NOT_FOUND
+    count++;
+
+    ret = nvs_set_u8(handle, "fail_count", count);
+    if (ret == ESP_OK) {
+        nvs_commit(handle);
+        ESP_LOGW(TAG, "WiFi failed boot count: %d/%d", count, WIFI_AP_FALLBACK_THRESHOLD);
+    } else {
+        ESP_LOGE(TAG, "Failed to save fail count: %s", esp_err_to_name(ret));
+    }
+
+    nvs_close(handle);
+}
+
+void wifi_reset_failed_boot_count(void)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for fail count reset");
+        return;
+    }
+
+    ret = nvs_set_u8(handle, "fail_count", 0);
+    if (ret == ESP_OK) {
+        nvs_commit(handle);
+        ESP_LOGI(TAG, "WiFi failed boot count reset");
+    } else {
+        ESP_LOGE(TAG, "Failed to reset fail count: %s", esp_err_to_name(ret));
+    }
+
+    nvs_close(handle);
+}
+
 static esp_err_t wifi_init_netif_and_event_loop(void)
 {
     esp_err_t ret;

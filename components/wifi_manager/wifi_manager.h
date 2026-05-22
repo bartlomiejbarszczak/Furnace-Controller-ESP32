@@ -9,6 +9,9 @@
 #define WIFI_NVS_NAMESPACE "wifi_config"
 #define WIFI_MAXIMUM_RETRY  5
 
+// Number of consecutive failed boots before permanent AP mode is entered
+#define WIFI_AP_FALLBACK_THRESHOLD 3
+
 // WiFi connection status
 typedef enum {
     WIFI_STATUS_DISCONNECTED = 0,
@@ -83,5 +86,23 @@ bool wifi_credentials_exist(void);
  * @return ESP_OK on success
  */
 esp_err_t wifi_erase_credentials(void);
+
+/**
+ * @brief Get the number of consecutive failed WiFi boot attempts from NVS
+ * @return Failed boot count (0 if never failed or key missing)
+ */
+uint8_t wifi_get_failed_boot_count(void);
+
+/**
+ * @brief Increment the failed WiFi boot counter in NVS
+ * Should be called after a connection attempt fails at boot time.
+ */
+void wifi_increment_failed_boot_count(void);
+
+/**
+ * @brief Reset the failed WiFi boot counter in NVS to zero
+ * Should be called after a successful WiFi connection at boot time.
+ */
+void wifi_reset_failed_boot_count(void);
 
 #endif // WIFI_MANAGER_H

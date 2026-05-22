@@ -22,6 +22,11 @@
 #define TEMP_OVERHEAT 95        // Overheat temperature threshold [°C]
 #define TEMP_FREEZE_THRESHOLD 4 // Temperature freeze alert threshold [°C]
 #define NUM_TEMP_SENSORS 4      // Number of DS18B20 temperature sensors
+
+// GPIO_NUM_0 is the built-in BOOT button on most ESP32 devboards.
+// Change this to whichever GPIO your hardware uses.
+#define WIFI_CONFIG_BUTTON_PIN GPIO_NUM_0
+#define WIFI_CONFIG_BUTTON_HOLD_MS 3000  // Hold duration to trigger AP mode
     
 static const char *TAG = "FURNACE";
 
@@ -52,6 +57,7 @@ bool load_config_from_sd(furnace_config_t *config);
 bool save_wifi_config_to_sd(const char *ssid, const size_t ssid_len, const char *password, const size_t password_len);
 bool load_wifi_config_from_sd(char *ssid, size_t ssid_size, char *password, size_t password_size);
 void initialize_time(void);
+void wifi_config_button_task(void *pvParameters);
 
 /**
  * @brief Wrapper for saving configuration to both NVS and SD card
@@ -1061,6 +1067,59 @@ void set_blower_power(uint8_t power) {
     }
 }
 
+/**
+ * @brief WiFi config escape-hatch task
+ *
+ * Polls WIFI_CONFIG_BUTTON_PIN on core 1. If the button is held for
+ * WIFI_CONFIG_BUTTON_HOLD_MS the device enters AP config mode and restarts
+ * once new credentials are saved. Has no effect if AP mode is already active.
+ *
+ * @param pvParameters Unused
+ */
+void wifi_config_button_task(void *pvParameters)
+{
+    // Configure button pin as input with internal pull-up
+    gpio_config_t btn_conf = {
+        .pin_bit_mask = (1ULL << WIFI_CONFIG_BUTTON_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+    gpio_config(&btn_conf);
+
+    uint32_t press_start = 0;
+    bool pressing = false;
+
+    while (1) {
+        // Button is active-low (pulled high, shorts to GND when pressed)
+        bool button_down = (gpio_get_level(WIFI_CONFIG_BUTTON_PIN) == 0);
+
+        if (button_down && !pressing) {
+            press_start = millis();
+            pressing = true;
+        } else if (!button_down && pressing) {
+            pressing = false;
+        } else if (button_down && pressing) {
+            uint32_t held_ms = millis() - press_start;
+            if (held_ms >= WIFI_CONFIG_BUTTON_HOLD_MS) {
+                if (!ap_web_server_is_running()) {
+                    ESP_LOGW(TAG, "Config button held %lums - entering AP mode", (unsigned long)held_ms);
+                    esp_err_t err = ap_web_server_init(wifi_ssid, wifi_password);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "Failed to start AP mode from button: %s", esp_err_to_name(err));
+                    }
+                } else {
+                    ESP_LOGI(TAG, "Config button held but AP mode already active");
+                }
+                pressing = false; // Prevent repeated triggers
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50)); // 50 ms poll — responsive without hammering
+    }
+}
+
 // ============== MAIN ENTRY POINT ==============
 
 /**
@@ -1166,37 +1225,53 @@ void app_main(void) {
     // Initialize WiFi
     ESP_LOGI(TAG, "Initializing WiFi...");
 
-    // Load WiFi credentials from SD card or NVS
-    if (!load_wifi_config_from_sd(wifi_ssid, sizeof(wifi_ssid), wifi_password, sizeof(wifi_password))) {
-        // If not on SD card, try loading from NVS
+    // Load WiFi credentials: SD card takes priority, fall back to NVS
+    bool has_credentials = false;
+    if (load_wifi_config_from_sd(wifi_ssid, sizeof(wifi_ssid), wifi_password, sizeof(wifi_password))) {
+        has_credentials = true;
+    } else {
         err = wifi_load_credentials(wifi_ssid, wifi_password);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Loaded WiFi credentials: SSID='%s'  PASSWORD='%s'", wifi_ssid, wifi_password);
+            has_credentials = true;
+            ESP_LOGI(TAG, "Loaded WiFi credentials from NVS: SSID='%s'", wifi_ssid);
             if (save_wifi_config_to_sd(wifi_ssid, strlen(wifi_ssid), wifi_password, strlen(wifi_password))) {
-                ESP_LOGI(TAG, "WiFi credentials loaded from NVS saved to SD card");
+                ESP_LOGI(TAG, "NVS credentials mirrored to SD card");
             } else {
-                ESP_LOGW(TAG, "Failed to save loaded from NVS WiFi credentials to SD card");
+                ESP_LOGW(TAG, "Failed to mirror NVS credentials to SD card");
             }
         } else {
-            ESP_LOGW(TAG, "No WiFi credentials found");
+            ESP_LOGW(TAG, "No WiFi credentials found anywhere");
         }
     }
 
-    // Always try to connect - if no credentials, this will fail and we'll enter AP mode
-    err = wifi_init_sta();
-    if (err != ESP_OK) {
-    // if (true) {
-        ESP_LOGW(TAG, "WiFi connection failed (error: %s), starting AP config mode...", esp_err_to_name(err));
-        ap_web_server_start(wifi_ssid, wifi_password);
+    // Attempt WiFi connection (only if credentials exist)
+    bool wifi_connected = false;
+    if (has_credentials) {
+        err = wifi_init_sta();
+        if (err == ESP_OK) {
+            wifi_connected = true;
+            wifi_reset_failed_boot_count();
+            ESP_LOGI(TAG, "WiFi connected successfully");
+        } else {
+            wifi_increment_failed_boot_count();
+            ESP_LOGW(TAG, "WiFi connection failed (error: %s) - fail count: %d/%d",
+                     esp_err_to_name(err),
+                     wifi_get_failed_boot_count(),
+                     WIFI_AP_FALLBACK_THRESHOLD);
+        }
     }
 
     if (sd_logger_is_ready()) {
         sd_logger_set_vprintf_handler(true);
         ESP_LOGI(TAG, "SD card logging enabled");
     }
-    
-    // Initialize system time synchronization (SNTP)
-    initialize_time();
+
+    // Initialize system time synchronization (SNTP) — only useful with WiFi
+    if (wifi_connected) {
+        initialize_time();
+    } else {
+        ESP_LOGW(TAG, "Skipping SNTP — no WiFi connection");
+    }
 
     // Initialize GPIO pins for pump relays (ON/OFF)
     gpio_config_t io_conf = {
@@ -1207,7 +1282,7 @@ void app_main(void) {
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&io_conf);
-    
+
     // Initialize GPIO pins for TRIAC power control
     gpio_config_t triac_conf = {
         .pin_bit_mask = (1ULL << config.pin_pump_mixing_control) | (1ULL << config.pin_blower_control),
@@ -1217,11 +1292,11 @@ void app_main(void) {
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&triac_conf);
-    
+
     // TODO: Initialize TRIAC control drivers
     // triac_init(config.pin_pump_mixing_control);
     // triac_init(config.pin_blower_control);
-    
+
     // Initialize DS18B20 temperature sensors
     temp_sensors[0].gpio_pin = config.pin_temp_sensor_furnace;
     temp_sensors[0].name = "Furnace";
@@ -1239,7 +1314,7 @@ void app_main(void) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize DS18B20 sensors!");
     }
-    
+
     // Initialize runtime state variables
     runtime.current_state = STATE_IDLE;
     runtime.state_entry_time = millis();
@@ -1247,57 +1322,78 @@ void app_main(void) {
     runtime.last_fsm_update_time = millis();
     runtime.last_cooling_alert_time = 0;
     runtime.temp_history_index = 0;
-    
+
     // Initialize temperature history buffer to zero
     for (int i = 0; i < BUFFER_SIZE; i++) {
         runtime.temp_furnace_history[i] = 0;
     }
-    
+
     // Configure MQTT manager with data sources and callbacks
     mqtt_manager_set_data_sources(&config, &runtime, furnace_mutex);
     mqtt_manager_set_wifi_callbacks(wifi_is_connected, wifi_get_rssi);
     mqtt_manager_set_config_save_callback(config_save_wrapper);
-    
+
     ESP_LOGI(TAG, "Creating FreeRTOS tasks...");
-    
-    // Create FreeRTOS tasks
+
+    // Create FreeRTOS tasks — always, regardless of WiFi state
     BaseType_t result;
-    
+
     result = xTaskCreatePinnedToCore(sensor_task, "Sensors", 4096, NULL, 8, NULL, 0);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Sensors task! Error: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to create Sensors task!");
         esp_restart();
     }
 
     result = xTaskCreatePinnedToCore(temp_furnace_history_task, "FurnaceHist", 2048, NULL, 5, NULL, 0);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Furnace Temperature History task! Error: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to create Furnace Temperature History task!");
         esp_restart();
     }
-    
+
     result = xTaskCreatePinnedToCore(control_task, "Control", 4096, NULL, 10, NULL, 0);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Control task! Error: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to create Control task!");
         esp_restart();
     }
-    
+
     result = xTaskCreatePinnedToCore(mqtt_task, "MQTT", 8192, NULL, 3, NULL, 1);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create MQTT task! Error: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to create MQTT task!");
         esp_restart();
     }
-    
+
     result = xTaskCreatePinnedToCore(watchdog_task, "Watchdog", 2048, NULL, 12, NULL, 1);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Watchdog task! Error: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to create Watchdog task!");
         esp_restart();
     }
-    
+
     result = xTaskCreatePinnedToCore(ota_task, "OTA", 8192, NULL, 2, NULL, 1);
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create OTA task! Error: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to create OTA task!");
         // OTA is non-critical — log the error but do not restart
     }
 
-    ESP_LOGI(TAG, "=== System Ready ===");
+    result = xTaskCreatePinnedToCore(wifi_config_button_task, "WifiBtn", 2048, NULL, 1, NULL, 1);
+    if (result != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create WiFi config button task (non-critical)");
+    }
+
+    // ---- AP mode fallback (runs in background, furnace tasks already started) ----
+    bool need_ap = !has_credentials || (wifi_get_failed_boot_count() >= WIFI_AP_FALLBACK_THRESHOLD);
+    if (need_ap) {
+        if (!has_credentials) {
+            ESP_LOGW(TAG, "No WiFi credentials — starting AP config mode");
+        } else {
+            ESP_LOGW(TAG, "Too many failed WiFi boots (%d) — starting AP config mode",
+                     wifi_get_failed_boot_count());
+        }
+        err = ap_web_server_init(wifi_ssid, wifi_password);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start AP mode: %s", esp_err_to_name(err));
+        }
+    }
+
+    ESP_LOGI(TAG, "=== System Ready (WiFi: %s, AP: %s) ===", wifi_connected ? "connected" : "offline", ap_web_server_is_running() ? "active" : "inactive");
+    ESP_LOGE(TAG, "OTA WORKED PERFECTYLUY DHBASUHFBASFBUASBFUHSABFHSBDGIFHGDSFIGHDSBFHDSBFBDSHJFBDSHJFBH");
 }
