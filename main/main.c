@@ -1165,30 +1165,29 @@ void app_main(void) {
 
     // Initialize WiFi
     ESP_LOGI(TAG, "Initializing WiFi...");
-    
+
     // Load WiFi credentials from SD card or NVS
     if (!load_wifi_config_from_sd(wifi_ssid, sizeof(wifi_ssid), wifi_password, sizeof(wifi_password))) {
         // If not on SD card, try loading from NVS
         err = wifi_load_credentials(wifi_ssid, wifi_password);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Loaded WiFi credentials: SSID='%s'", wifi_ssid);
+            ESP_LOGI(TAG, "Loaded WiFi credentials: SSID='%s'  PASSWORD='%s'", wifi_ssid, wifi_password);
             if (save_wifi_config_to_sd(wifi_ssid, strlen(wifi_ssid), wifi_password, strlen(wifi_password))) {
                 ESP_LOGI(TAG, "WiFi credentials loaded from NVS saved to SD card");
             } else {
                 ESP_LOGW(TAG, "Failed to save loaded from NVS WiFi credentials to SD card");
             }
         } else {
-            ESP_LOGE(TAG, "No WiFi credentials found, starting AP config mode...");
-            ap_web_server_start();
+            ESP_LOGW(TAG, "No WiFi credentials found");
         }
     }
 
-    err = wifi_init_sta_with_credentials(wifi_ssid, wifi_password);
-    if (err == ESP_ERR_NOT_FOUND) {
-        ESP_LOGW(TAG, "WiFi initialization failed, restarting");
-        esp_restart();
-    } else if (err != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi initialization failed, will retry in background. Error: %s", esp_err_to_name(err));
+    // Always try to connect - if no credentials, this will fail and we'll enter AP mode
+    err = wifi_init_sta();
+    if (err != ESP_OK) {
+    // if (true) {
+        ESP_LOGW(TAG, "WiFi connection failed (error: %s), starting AP config mode...", esp_err_to_name(err));
+        ap_web_server_start(wifi_ssid, wifi_password);
     }
 
     if (sd_logger_is_ready()) {
