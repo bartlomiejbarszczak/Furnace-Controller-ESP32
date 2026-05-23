@@ -14,6 +14,10 @@ extern "C" {
 /** Path to version descriptor JSON on the server */
 #define OTA_VERSION_JSON_URL    OTA_SERVER_BASE_URL "/version.json"
 
+/** NVS namespace and key used to persist the last successfully flashed version */
+#define OTA_NVS_NAMESPACE       "ota"
+#define OTA_NVS_KEY_VERSION     "version"
+
 /** How often the OTA task checks for a new version (milliseconds) */
 #define OTA_CHECK_INTERVAL_MS   (5 * 60 * 1000)    /* 5 minutes */
 

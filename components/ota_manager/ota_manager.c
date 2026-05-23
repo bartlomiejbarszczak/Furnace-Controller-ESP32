@@ -13,6 +13,9 @@
 #include "esp_https_ota.h"
 #include "esp_app_desc.h"
 
+#include "nvs_flash.h"
+#include "nvs.h"
+
 #include "wifi_manager.h"   /* wifi_is_connected() */
 
 static const char *TAG = "OTA";
@@ -80,6 +83,79 @@ static int semver_compare(const semver_t *a, const semver_t *b)
     if (a->minor != b->minor) return (a->minor > b->minor) ? 1 : -1;
     if (a->patch != b->patch) return (a->patch > b->patch) ? 1 : -1;
     return 0;
+}
+
+// ============== NVS VERSION CACHE ==============
+
+/** Cached version string loaded once at boot — empty string means not loaded yet */
+static char s_nvs_version[32] = { 0 };
+static bool s_nvs_version_loaded = false;
+
+/**
+ * @brief Load the last OTA-flashed version from NVS (once) and return it.
+ *
+ * On the very first boot (no NVS entry yet) falls back to
+ * esp_app_get_description()->version so the first comparison works correctly.
+ *
+ * @return Null-terminated version string — never NULL.
+ */
+static const char *ota_nvs_load_version(void)
+{
+    if (s_nvs_version_loaded) {
+        return s_nvs_version;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &handle);
+
+    if (err == ESP_OK) {
+        size_t required = sizeof(s_nvs_version);
+        err = nvs_get_str(handle, OTA_NVS_KEY_VERSION, s_nvs_version, &required);
+        nvs_close(handle);
+    }
+
+    if (err != ESP_OK || s_nvs_version[0] == '\0') {
+        /* NVS empty — first ever boot; use app descriptor as baseline */
+        const esp_app_desc_t *desc = esp_app_get_description();
+        strncpy(s_nvs_version, desc->version, sizeof(s_nvs_version) - 1);
+        s_nvs_version[sizeof(s_nvs_version) - 1] = '\0';
+        ESP_LOGW(TAG, "NVS version not found — using app_desc fallback: %s", s_nvs_version);
+    } else {
+        ESP_LOGI(TAG, "NVS version loaded: %s", s_nvs_version);
+    }
+
+    s_nvs_version_loaded = true;
+    return s_nvs_version;
+}
+
+/**
+ * @brief Persist a version string to NVS after a successful firmware flash.
+ *
+ * @param version   Null-terminated semver string, e.g. "1.2.0"
+ * @return ESP_OK on success
+ */
+static esp_err_t ota_nvs_save_version(const char *version)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(handle, OTA_NVS_KEY_VERSION, version);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "NVS version saved: %s", version);
+    } else {
+        ESP_LOGE(TAG, "NVS version save failed: %s", esp_err_to_name(err));
+    }
+
+    return err;
 }
 
 /**
@@ -275,9 +351,9 @@ static esp_err_t ota_check_and_update(void)
     esp_err_t err = fetch_version_info(&server);
     if (err != ESP_OK) return err;
 
-    /* ── 2. Get running firmware version ───────────────────────────────── */
-    const esp_app_desc_t *running = esp_app_get_description();
-    ESP_LOGI(TAG, "Running firmware: version=%s", running->version);
+    /* ── 2. Get running firmware version from NVS ──────────────────────── */
+    const char *running_version = ota_nvs_load_version();
+    ESP_LOGI(TAG, "Running firmware: version=%s (from NVS)", running_version);
 
     /* ── 3. Parse and compare versions ────────────────────────────────── */
     semver_t sv_server  = { 0 };
@@ -288,31 +364,34 @@ static esp_err_t ota_check_and_update(void)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    if (!parse_semver(running->version, &sv_running)) {
-        ESP_LOGW(TAG, "Could not parse running version string: '%s' — forcing update check", running->version);
-        /* Allow update to proceed if we cannot parse the running version */
+    if (!parse_semver(running_version, &sv_running)) {
+        ESP_LOGW(TAG, "Could not parse running version string: '%s' — treating as 0.0.0", running_version);
+        /* sv_running stays {0,0,0} — any valid server version will trigger update */
     }
 
     int cmp = semver_compare(&sv_server, &sv_running);
 
     if (cmp == 0) {
-        ESP_LOGI(TAG, "Firmware is up to date (%s)", running->version);
+        ESP_LOGI(TAG, "Firmware is up to date (%s)", running_version);
         return ESP_OK;
     }
 
     if (cmp < 0) {
         ESP_LOGW(TAG, "Server version %s is OLDER than running %s — skipping",
-                 server.version, running->version);
+                 server.version, running_version);
         return ESP_OK;
     }
 
     /* ── 4. Newer version found — update ──────────────────────────────── */
-    ESP_LOGI(TAG, "New firmware available: %s → %s", running->version, server.version);
+    ESP_LOGI(TAG, "New firmware available: %s → %s", running_version, server.version);
 
     err = download_and_flash(server.url);
     if (err != ESP_OK) return err;
 
-    /* ── 5. Reboot into the new firmware ──────────────────────────────── */
+    /* ── 5. Persist new version to NVS before reboot ─────────────────── */
+    ota_nvs_save_version(server.version);
+
+    /* ── 6. Reboot into the new firmware ──────────────────────────────── */
     ESP_LOGI(TAG, "Update complete — rebooting in 2 seconds...");
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();

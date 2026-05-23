@@ -11,5 +11,6 @@ idf_component_register(
         freertos
         log
         heap
+        nvs_flash
         wifi_manager
 )
